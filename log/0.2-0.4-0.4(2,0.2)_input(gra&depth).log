@@ -1,0 +1,13 @@
+[DEBUG]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:18:46,092, Namespace(config='config.yml', dataset_path='../data/', skip_frame=3, pcd_sample=30000, max_deg=2, max_tran=0.2, mag_randomly=True, batch_size=16, num_workers=8, pin_memory=True, device='cuda:0', resume='', pretrained='checkpoint/0.2-0.4-0.4(5,0.1)_input(gra&depth)_best.pth', epoch=100, log_dir='log/', checkpoint_dir='checkpoint/', name='0.2-0.4-0.4(2,0.2)_input(gra&depth)', optim='adam', lr0=1e-05, gamma=0.99, momentum=0.9, weight_decay=0.0001, lr_exp_decay=0.98, clip_grad=1.0, scale=50.0, inner_iter=1, alpha=0.2, beta=0.4, gama=0.4, resize_ratio=[1.0, 1.0])
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:23:02,441, Epoch 001|100, train loss:2.8840
+[DEBUG]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:23:24,039, Best model saved (Epoch 1)
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:23:24,039, val_loss: 2.727590
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:23:24,039, loss_se3: 0.016381
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:23:26,299, Evaluate loss_dR:0.005019, loss_dT:0.056163, se3_loss:0.016381
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:27:42,487, Epoch 002|100, train loss:2.8785
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:28:04,289, Evaluate loss_dR:0.005036, loss_dT:0.056178, se3_loss:0.016398
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:32:20,460, Epoch 003|100, train loss:2.8757
+[DEBUG]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:32:42,091, Best model saved (Epoch 3)
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:32:42,091, val_loss: 2.707283
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:32:42,091, loss_se3: 0.016336
+[INFO]:0.2-0.4-0.4(2,0.2)_input(gra&depth)|Train, 2025-04-15 15:32:44,244, Evaluate loss_dR:0.004584, loss_dT:0.056063, se3_loss:0.016336
