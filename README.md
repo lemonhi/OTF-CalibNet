@@ -1,4 +1,3 @@
-﻿@[TOC](这里写自定义目录标题)
 
 # OTF-CalibNet: On-the-fly Calibration Network for Synchronous LiDAR-Camera Systems
 
