@@ -42,12 +42,13 @@ Dataset Should be organized into data/ filefolder in our root:
 The following command is fit with a 24GB GPU.
 
 ```
-python train.py --batch_size=8 --epoch=100 --inner_iter=1 --pcd_sample=4096 --name=cam2_oneiter --skip_frame=10
+python train.py or 直接点击运行train.py文件即可
+
 ```
 ### Test
 
 ```
-python test.py --inner_iter=1 --pretrained=./checkpoint/cam2_oneiter_best.pth --skip_frame=1 --pcd_sample=-1
+python test.py or 直接点击运行test.py文件即可
 ```
 Download pretrained `链接: https://pan.baidu.com/s/1YwY65gI1ywYRKmA1L_we4A?pwd=sk8u 提取码: sk8u` from here and put it into root/checkpoint/.
 ## Results on KITTI Odometry Test (Seq = 11, one iter)
