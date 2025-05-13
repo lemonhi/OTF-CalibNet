@@ -2,43 +2,39 @@ OTF-CalibNet: On-the-fly Calibration Network for Synchronous LiDAR-Camera System
 the code was implemented by Jiahui Chai for the paper OTF-CalibNet
 
 Implemented Environment
-Ubuntu 20.04
-
-Pytorch 2.4.0
-
-CUDA 12.4
-
-Python 3.12.5
-
-Intel i9 13900K CPU and NVIDIA GeForce RTX4090 GPU
+  Ubuntu 20.04
+  Pytorch 2.4.0
+  CUDA 12.4
+  Python 3.12.5
+  Intel i9 13900K CPU and NVIDIA GeForce RTX4090 GPU
 
 Dataset Preparation
-KITTI Odometry
-http://www.cvlibs.net/datasets/kitti/eval_odometry.php
-Dataset Should be organized into data/ filefolder in our root:
-/PATH/TO/OTF-CalibNet/
-–|data/
-–|poses/
-–|00.txt
-–|01.txt
-–…
-–|sequences/
-–|00/
-–|image_2/
-–|image_3/
-–|velodyne/
-–|calib.txt
-–|times.txt
-–|01/
-–|02/
-–…
-–…
+  KITTI Odometry
+  http://www.cvlibs.net/datasets/kitti/eval_odometry.php
+  Dataset Should be organized into data/ filefolder in our root:
+  /PATH/TO/OTF-CalibNet/
+  –|data/
+  –|poses/
+  –|00.txt
+  –|01.txt
+  –…
+  –|sequences/
+  –|00/
+  –|image_2/
+  –|image_3/
+  –|velodyne/
+  –|calib.txt
+  –|times.txt
+  –|01/
+  –|02/
+  –…
+  –…
 
 Train and Test
-Train
-The following command is fit with a 24GB GPU.
-
-python train.py --batch_size=8 --epoch=100 --inner_iter=1 --pcd_sample=4096 --name=cam2_oneiter --skip_frame=10
+  Train
+  The following command is fit with a 24GB GPU.
+  
+  python train.py --batch_size=8 --epoch=100 --inner_iter=1 --pcd_sample=4096 --name=cam2_oneiter --skip_frame=10
 Test
 python test.py --inner_iter=1 --pretrained=./checkpoint/cam2_oneiter_best.pth --skip_frame=1 --pcd_sample=-1
 Download pretrained 链接: https://pan.baidu.com/s/1YwY65gI1ywYRKmA1L_we4A?pwd=sk8u 提取码: sk8u from here and put it into root/checkpoint/.
