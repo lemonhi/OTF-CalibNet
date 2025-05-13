@@ -1,0 +1,9 @@
+dataset:
+  train: [1,2,3,4,5,6,7,8]
+  val: [9,10]
+  test: [11]
+  cam_id: 3  # (2 or 3)
+  voxel_size: 0.1
+  pooling: 5  # max pooling of semi-dense image, must be odd
+  extend_ratio: [2.5,2.5]
+
