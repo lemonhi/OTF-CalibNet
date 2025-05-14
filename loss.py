@@ -8,25 +8,6 @@ from scipy.spatial.transform import Rotation
 import numpy as np
 import cv2
     
-class Photo_Loss(nn.Module):
-    def __init__(self,scale=1.0,reduction='mean'):
-        super(Photo_Loss, self).__init__()
-        assert reduction in ['sum','mean','none'], 'Unknown or invalid reduction'
-        self.scale = scale
-        self.reduction = reduction
-    def forward(self,input:torch.Tensor,target:torch.Tensor):
-        """Photo loss
-
-        Args:
-            input (torch.Tensor): (B,H,W)
-            target (torch.Tensor): (B,H,W)
-
-        Returns:
-            torch.Tensor: scaled mse loss between input and target
-        """
-        return F.mse_loss(input/self.scale,target/self.scale,reduction=self.reduction)
-    def __call__(self,input:torch.Tensor,target:torch.Tensor)->torch.Tensor:
-        return self.forward(input,target)
 class GradientDifferenceLoss(nn.Module):
     def __init__(self, scale=1.0, reduction='mean'):
         super(GradientDifferenceLoss, self).__init__()
