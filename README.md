@@ -5,7 +5,22 @@ one synchronized image–point-cloud pair. It uses synthetic perturbations for
 supervised training. Inference uses one forward pass and no calibration target.
 Continuous physical sensor drift and embedded-platform performance are not evaluated.
 
+<p align="center">
+  <a href="assets/figures/overview.png"><img src="assets/figures/overview.png" alt="OTF-CalibNet overview: LiDAR projection, structural feature extraction and extrinsic refinement" width="960"></a>
+</p>
+
+*Method overview. A synchronized RGB–LiDAR pair provides structural inputs for single-frame rotation and translation refinement.*
+
+[Architecture](#inputs-and-network) · [Installation](#installation) · [Training](#training) · [Evaluation](#evaluation-and-synchronized-timing) · [Results](#reported-results)
+
 ## Inputs and network
+
+<p align="center">
+  <a href="assets/figures/architecture.png"><img src="assets/figures/architecture.png" alt="Asymmetric RGB and depth branches with Canny and Laplacian preprocessing, feature fusion and pose regression" width="680"></a>
+</p>
+
+*Network architecture. Canny RGB edges and depth Laplacian responses feed asymmetric feature branches and a global aggregation module.*
+
 
 The dataset and inference pipeline share camera-z depth projection followed by
 5×5 max pooling. RGB is converted to grayscale for Canny (thresholds 100/200).
@@ -71,6 +86,12 @@ metadata are not included; a dataset adapter and sequence manifest are needed to
 The reported 640×480 image size belongs to that acquisition system. KITTI image
 size follows the loaded files and explicit `--resize_ratio`.
 
+<p align="center">
+  <a href="assets/figures/sensor-system.png"><img src="assets/figures/sensor-system.png" alt="Custom synchronized LiDAR-camera acquisition system and its hardware components" width="800"></a>
+</p>
+
+*Self-collected data acquisition system shown in the paper.*
+
 ## Training
 
 ```bash
@@ -133,6 +154,13 @@ XYZ Euler rotation errors in radians followed by inverse-transform translation
 errors in metres. Warm-up calls are excluded from timing statistics.
 
 ## Reported results
+
+<p align="center">
+  <a href="assets/figures/alignment-results.png"><img src="assets/figures/alignment-results.png" alt="Qualitative LiDAR-camera alignment results across scenes in the self-collected dataset" width="800"></a>
+</p>
+
+*Qualitative alignment examples from the paper, using refined calibration parameters. Click any figure to open it at full size.*
+
 
 | Initial perturbation | Mean rotation error | Mean translation error |
 | --- | --- | --- |
