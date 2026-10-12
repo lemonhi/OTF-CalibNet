@@ -42,15 +42,45 @@ Dataset Should be organized into data/ filefolder in our root:
 The following command is fit with a 24GB GPU.
 
 ```
-python train.py or 直接点击运行train.py文件即可
+python train_otf.py --config config.yml --dataset_path ./data --rgb_encoding zero_one
 
 ```
 ### Test
 
 ```
-python test.py or 直接点击运行test.py文件即可
+python test_otf.py --config config.yml --dataset_path ./data --pretrained ./checkpoint/MATCHING_CHECKPOINT.pth --rgb_encoding zero_one
 ```
 Download pretrained `链接: https://pan.baidu.com/s/1YwY65gI1ywYRKmA1L_we4A?pwd=sk8u 提取码: sk8u` from here and put it into root/checkpoint/.
+## Shared input preprocessing
+
+Training, validation, and testing all call `prepare_inputs` in
+`otf_preprocessing.py`. RGB images are converted to grayscale and processed
+with OpenCV Canny (default thresholds 100 and 200, `L2gradient=True`).
+Depth maps are processed with the 3-by-3 Laplacian kernel
+`[[0,1,0],[1,-4,1],[0,1,0]]`; response magnitudes are normalized per image.
+Both returned tensors have shape `[B,1,H,W]` and values in `[0,1]`.
+The dataset applies depth pooling before feature extraction. The existing
+network's internal depth scaling and pooling are retained in this patch.
+The repository dataset uses PIL images with `ToTensor`, matching
+`--rgb_encoding zero_one`. Use matching preprocessing settings for training
+and evaluation. Install OpenCV using the added requirements entry.
+
+Earlier released scripts used Sobel features and bypassed the depth feature
+in training. These entry points now pass both Canny and Laplacian features
+to the network. This correction alone does not establish that existing
+checkpoints or historical results were produced with these inputs.
+New training checkpoints record `preprocessing_version` and Canny settings.
+Unverified checkpoints are rejected by default for evaluation and resume;
+`--allow_legacy_checkpoint` permits evaluation only as a diagnostic. Do not
+add a version tag to old weights without verifying their training provenance.
+
+This patch does not change losses, model architecture, dataset splits, or
+legacy runtime measurements. `config.yml` currently contains the older
+sequence split, and the results below are historical examples. Neither those
+results nor the original test timer should be interpreted as validation of
+the revised manuscript's accuracy or synchronized latency. Full reproduction
+requires the corresponding experiment configuration and matching weights.
+
 ## Results on KITTI Odometry Test (Seq = 11, one iter)
 ![](https://i-blog.csdnimg.cn/direct/bdbcb721534d426db180df9b14553c76.jpeg#pic_center)左上角为原始图像，右上角为gt外参进行可视化结果
 右下角为受扰动外参可视化结果，右下角为通过OTF-CalibNet网络标定后的可视化结果
