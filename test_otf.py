@@ -1,4 +1,5 @@
 import argparse
+from otf_preprocessing import add_preprocessing_options, prepare_inputs, PREPROCESSING_VERSION
 import os
 
 import cv2
@@ -50,33 +51,10 @@ def options():
     # setting
     parser.add_argument("--inner_iter", type=int, default=1, help='inner iter of calibnet')
     # if CUDA is out of memory, please reduce batch_size, pcd_sample or inner_iter
+    add_preprocessing_options(parser)
+    parser.add_argument('--allow_legacy_checkpoint', action='store_true',
+                        help='Diagnostic only: permit weights with unverified preprocessing')
     return parser.parse_args()
-
-
-def computegradients(depthmap):
-    # 假设 depthmap 的形状是 (batchsize, channels, height, width)
-    # 定义 Sobel 卷积核
-    sobelx = torch.tensor([[1, 0, -1],
-                           [2, 0, -2],
-                           [1, 0, -1]], dtype=depthmap.dtype, device=depthmap.device).unsqueeze(0).unsqueeze(
-        0)  # (1, 1, 3, 3)
-    sobely = torch.tensor([[1, 2, 1],
-                           [0, 0, 0],
-                           [-1, -2, -1]], dtype=depthmap.dtype, device=depthmap.device).unsqueeze(0).unsqueeze(
-        0)  # (1, 1, 3, 3)
-
-    # 确保输入图像是单通道的
-    depthmap_single_channel = depthmap.mean(dim=1, keepdim=True)  # 平均所有通道得到单通道图像
-
-    # 计算梯度
-    gradx = F.conv2d(depthmap_single_channel, sobelx, padding=1)
-    grady = F.conv2d(depthmap_single_channel, sobely, padding=1)
-
-    # 计算梯度幅值
-    gradmagnitude = torch.sqrt(gradx ** 2 + grady ** 2)
-
-    # 由于我们只计算了一个通道的梯度，所以不需要再次取平均
-    return gradmagnitude
 
 
 def test(args, chkpt: dict, test_loader,total_time=0):
@@ -109,17 +87,13 @@ def test(args, chkpt: dict, test_loader,total_time=0):
         igt = batch['igt'].to(device)
         img_shape = rgb_img.shape[-2:]
         depth_generator = utils.transform.DepthImgGenerator(img_shape, InTran, pcd_range, CONFIG['dataset']['pooling'])
-        # model(rgb_img,uncalibed_depth_img)
         Tcl = torch.eye(4).repeat(B, 1, 1).to(device)
         uncalibed_pcd_temp = uncalibed_pcd
         for j in range(args.inner_iter):
 
             start_time = time.time()
-            # 计算RGB梯度（假设rgb_img在整个过程中不变）
-            rgb_gradient = computegradients(rgb_img)
-            uncalibed_depth_img_gra = computegradients(uncalibed_depth_img)
-            # 使用当前深度图像调用模型，预测位姿
-            twist_rot, twist_tsl = model(rgb_gradient, uncalibed_depth_img_gra)
+            rgb_input, depth_input = prepare_inputs(rgb_img, uncalibed_depth_img, args)
+            twist_rot, twist_tsl = model(rgb_input, depth_input)
             iter_Tcl = utils.se3.exp(torch.cat([twist_rot, twist_tsl], dim=1))
             uncalibed_depth_img, uncalibed_pcd_temp = depth_generator(iter_Tcl,uncalibed_pcd_temp)
             Tcl = Tcl.bmm(iter_Tcl)
@@ -255,6 +229,15 @@ if __name__ == "__main__":
         CONFIG: dict = yaml.load(f, yaml.SafeLoader)
     if os.path.exists(args.pretrained) and os.path.isfile(args.pretrained):
         chkpt = torch.load(args.pretrained)
+        saved = chkpt['args']
+        if saved.get('preprocessing_version') != PREPROCESSING_VERSION:
+            if not args.allow_legacy_checkpoint:
+                raise ValueError('Checkpoint preprocessing is unverified. Use a matching checkpoint; '
+                                 '--allow_legacy_checkpoint is for diagnostics only.')
+            print_warning('Legacy checkpoint: accuracy is not validated for Canny/Laplacian inputs.')
+        for field in ('rgb_encoding', 'canny_low', 'canny_high'):
+            if field in saved and getattr(args, field) != saved[field]:
+                raise ValueError(f'{field} must match checkpoint value {saved[field]!r}')
         CONFIG.update(chkpt['config'])
         update_args = ['resize_ratio', 'name', 'scale']
         for up_arg in update_args:

@@ -1,4 +1,5 @@
 import argparse
+from otf_preprocessing import add_preprocessing_options, prepare_inputs, PREPROCESSING_VERSION
 from asyncio.log import logger
 import os
 import yaml
@@ -56,6 +57,7 @@ def options():
     parser.add_argument("--gama", type=float, default=0.4,help='weight of rt loss')
     parser.add_argument("--resize_ratio",type=float,nargs=2,default=[1.0,1.0])
     # if CUDA is out of memory, please reduce batch_size, pcd_sample or inner_iter
+    add_preprocessing_options(parser)
     return parser.parse_args()
 
 
@@ -89,14 +91,10 @@ def val(args,model:OTF_CalibNet,val_loader:DataLoader):
             igt = batch['igt'].to(device)
             img_shape = rgb_img.shape[-2:]
             depth_generator = utils.transform.DepthImgGenerator(img_shape,InTran,pcd_range,CONFIG['dataset']['pooling'])
-            # model(rgb_img,uncalibed_depth_img)
             g0 = torch.eye(4).repeat(B,1,1).to(device)
             for _ in range(args.inner_iter):
-                rgb_gradient = compute_single_channel_gradients(rgb_img)  # 计算 RGB 图像的梯度
-                # depth_gradient = compute_gradient(uncalibed_depth_img.unsqueeze(1))  # 计算深度图的梯度
-                uncalibed_depth_img_gradient = compute_gradients(uncalibed_depth_img)
-                # 在这里可以选择使用 rgb_gradient 或者 depth_gradient
-                twist_rot, twist_tsl = model(rgb_gradient,uncalibed_depth_img)
+                rgb_gradient, depth_gradient = prepare_inputs(rgb_img, uncalibed_depth_img, args)
+                twist_rot, twist_tsl = model(rgb_gradient, depth_gradient)
                 extran = utils.se3.exp(torch.cat([twist_rot,twist_tsl],dim=1))
                 uncalibed_depth_img, uncalibed_pcd = depth_generator(extran,uncalibed_pcd)
                 g0 = extran.bmm(g0)
@@ -137,56 +135,6 @@ def ensure_dir(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-
-
-def compute_gradients(depth_map):
-    # 假设 depth_map 的形状是 (batch_size, 1, height, width)
-    sobel_x = torch.tensor([[1, 0, -1],
-                             [2, 0, -2],
-                             [1, 0, -1]], dtype=depth_map.dtype, device=depth_map.device).unsqueeze(0).unsqueeze(0)  # (1, 1, 3, 3)
-
-    sobel_y = torch.tensor([[1, 2, 1],
-                             [0, 0, 0],
-                             [-1, -2, -1]], dtype=depth_map.dtype, device=depth_map.device).unsqueeze(0).unsqueeze(0)  # (1, 1, 3, 3)
-
-    # 计算水平和垂直梯度
-    grad_x = F.conv2d(depth_map, sobel_x, padding=1)  # (batch_size, 1, height, width)
-    grad_y = F.conv2d(depth_map, sobel_y, padding=1)  # (batch_size, 1, height, width)
-
-    # 计算梯度幅值
-    grad_magnitude = torch.sqrt(grad_x**2 + grad_y**2)  # (batch_size, 1, height, width)
-
-    return  grad_magnitude
-
-def compute_single_channel_gradients(rgb_batch):
-    # 确保输入图像形状为 (batch_size, 3, height, width)
-    device = rgb_batch.device  # 获取输入张量的设备
-    if rgb_batch.ndim != 4 or rgb_batch.shape[1] != 3:
-        raise ValueError("Input batch must have shape (batch_size, 3, height, width)")
-
-    # Sobel算子的定义
-    sobel_x = torch.tensor([[1, 0, -1],
-                            [2, 0, -2],
-                            [1, 0, -1]], dtype=rgb_batch.dtype).unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 3, 3)
-
-    sobel_y = torch.tensor([[1, 2, 1],
-                            [0, 0, 0],
-                            [-1, -2, -1]], dtype=rgb_batch.dtype).unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 3, 3)
-
-    gradients = []
-
-    # 对每个通道进行卷积来计算梯度
-    for i in range(3):  # 对R、G、B三个通道分别处理
-        grad_x = (F.conv2d(rgb_batch[:, i:i + 1], sobel_x, padding=1)).to(device)  # (batch_size, 1, height, width)
-        grad_y = (F.conv2d(rgb_batch[:, i:i + 1], sobel_y, padding=1)).to(device)  # (batch_size, 1, height, width)
-        grad_magnitude = torch.sqrt(grad_x.squeeze() ** 2 + grad_y.squeeze() ** 2)  # 计算总梯度
-        gradients.append(grad_magnitude.unsqueeze(1))  # 在第二维增加一维，变为 (batch_size, 1, height, width)
-
-    # 合并所有通道的梯度图
-    single_channel_gradient = torch.mean(torch.cat(gradients, dim=1), dim=1,
-                                         keepdim=True)  # 取均值，输出形状为 (batch_size, 1, height, width)
-
-    return single_channel_gradient
 
 
 def train(args,chkpt,train_loader:DataLoader,val_loader:DataLoader):
@@ -270,18 +218,12 @@ def train(args,chkpt,train_loader:DataLoader,val_loader:DataLoader):
 
                 img_shape = rgb_img.shape[-2:]
                 depth_generator = utils.transform.DepthImgGenerator(img_shape,InTran,pcd_range,CONFIG['dataset']['pooling'])
-                # model(rgb_img,uncalibed_depth_img)
                 Tcl = torch.eye(4).repeat(B,1,1).to(device)
 
                 # model.eval()
                 for _ in range(args.inner_iter):
-                    print(rgb_img.shape)
-                    rgb_gradient = compute_single_channel_gradients(rgb_img)  # 计算 RGB 图像的梯度
-                    print(rgb_gradient.shape)
-                    #depth_gradient = compute_gradient(uncalibed_depth_img.unsqueeze(1))  # 计算深度图的梯度
-                    # 在这里可以选择使用 rgb_gradient 或者 depth_gradient
-                    uncalibed_depth_img_gradient=compute_gradients(uncalibed_depth_img)
-                    twist_rot, twist_tsl = model(rgb_gradient, uncalibed_depth_img)
+                    rgb_gradient, depth_gradient = prepare_inputs(rgb_img, uncalibed_depth_img, args)
+                    twist_rot, twist_tsl = model(rgb_gradient, depth_gradient)
                     iter_Tcl = utils.se3.exp(torch.cat([twist_rot, twist_tsl], dim=1))
                     uncalibed_depth_img, uncalibed_pcd = depth_generator(iter_Tcl, uncalibed_pcd)
                     Tcl = Tcl.bmm(iter_Tcl)
@@ -348,6 +290,7 @@ if __name__ == "__main__":
     else:
         device = torch.device('cpu')  # 使用 CPU
     args = options()
+    args.preprocessing_version = PREPROCESSING_VERSION
     os.makedirs(args.log_dir,exist_ok=True)
     os.makedirs(args.checkpoint_dir,exist_ok=True)
     with open(args.config,'r')as f:
@@ -355,6 +298,8 @@ if __name__ == "__main__":
     assert isinstance(CONFIG,dict), 'Unknown config format!'
     if args.resume:
         chkpt = torch.load(args.resume,map_location='cpu')
+        if chkpt['args'].get('preprocessing_version') != PREPROCESSING_VERSION:
+            raise ValueError('Resume checkpoint uses unverified preprocessing; verify its provenance before reuse.')
         CONFIG.update(chkpt['config'])
         args.__dict__.update(chkpt['args'])
         print_highlight('config updated from resumed checkpoint {:s}'.format(args.resume))

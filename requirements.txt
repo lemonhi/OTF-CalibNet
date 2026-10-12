@@ -6,3 +6,5 @@ scipy==1.11.1
 #torch==1.8.2+cu111
 #torchvision==0.9.2+cu111
 tqdm==4.63.1
+
+opencv-python-headless>=4.8,<5
