@@ -67,7 +67,7 @@ keeps incomplete batches rather than dropping frames.
 
 The self-collected dataset is described as 13,923 pairs, split by acquisition
 sequence in a 7:2:1 ratio. Its raw files, exact split manifest, and calibration
-metadata are not included; this repository does not fabricate a substitute split.
+metadata are not included; a dataset adapter and sequence manifest are needed to use it.
 The reported 640×480 image size belongs to that acquisition system. KITTI image
 size follows the loaded files and explicit `--resize_ratio`.
 
@@ -80,12 +80,10 @@ python train_otf.py --config config.yml --dataset_path ./data \
 ```
 
 Use `--from_scratch` only for a diagnostic run without RGB pretraining.
-Learning rate, epochs, point sampling and batch size are exposed as command-line
-settings; their defaults are implementation defaults, not verified historical
-experiment settings. Checkpoints include configuration, preprocessing settings,
+Learning rate, epochs, point sampling and batch size are configurable through
+command-line arguments. Checkpoints include configuration, preprocessing settings,
 and `implementation_version`. Resume requires matching configuration.
-Old checkpoints are not automatically relabelled as compatible with this model
-and objective. Use matching weights and validate results before reporting them.
+Use checkpoints with matching architecture and preprocessing versions.
 
 ## Evaluation and synchronized timing
 
@@ -114,6 +112,26 @@ inverse-transform translations. Axis means and vector L2 means are reported
 separately. Euler convention and table aggregation must match the original
 experiment configuration for a controlled comparison.
 
+## Coordinate and output conventions
+
+Point clouds passed to `project_depth` are expressed in the camera coordinate
+system and have shape `[B,3,N]`. Intrinsics are `[3,3]` or `[B,3,3]`.
+The model returns two `[B,3]` tensors: an axis-angle rotation vector in radians
+and Cartesian translation in metres. `correction_matrix` forms the transform
+that maps the perturbed cloud toward its reference. For an initial extrinsic
+matrix `T_initial`, the refined matrix is `T_correction @ T_initial`.
+
+Evaluation checks the saved Canny settings, preprocessing version, camera,
+voxel size, pooling and field-of-view extension. It uses the checkpoint's
+image-resize ratio. Test sequences, perturbation magnitude and point sampling
+remain evaluation options; record these when comparing runs.
+
+`latency.csv` contains `frame,network_ms,pipeline_e2e_ms`.
+`latency_summary.json` contains timing statistics, input settings and device
+metadata. `errors.npy` stores six absolute component errors per frame:
+XYZ Euler rotation errors in radians followed by inverse-transform translation
+errors in metres. Warm-up calls are excluded from timing statistics.
+
 ## Reported results
 
 | Initial perturbation | Mean rotation error | Mean translation error |
@@ -122,10 +140,8 @@ experiment configuration for a controlled comparison.
 | ±1°, ±10 cm | 0.018° | 0.21 cm |
 
 Reported mean latencies are 15.27 ms for network inference and 24.76 ms for the
-calibration pipeline on the stated workstation. These are reported measurements,
-not results obtained by running this repository update. Architecture, projection,
-objective and input changes require matching checkpoints and fresh validation;
-the values above are not guaranteed by the code. Literature baselines are quoted
+calibration pipeline on the stated workstation. These values are measurements reported in the paper; measured runtime depends
+on the hardware, input size and software environment. Literature baselines are quoted
 from their publications and are not reproduced under a common protocol.
 
 ## Checks
@@ -136,5 +152,5 @@ python -m unittest discover -s tests -v
 
 The tests check signed gradient supervision, the squared Chamfer formula,
 inverse-correction targets, preprocessing shapes, and nonzero depth-loss gradients.
-Full KITTI training, accuracy reproduction and GPU latency measurement require
-the original frame manifests, RGB weights and experiment settings.
+Training and evaluation require dataset files and the relevant checkpoints.
+CUDA timing requires a CUDA-enabled PyTorch build and GPU.

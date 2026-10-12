@@ -203,8 +203,10 @@ class KITTI_perturb(Dataset):
         self.dataset = dataset
         self.file = file
         if self.file is not None:
-            self.perturb = torch.from_numpy(np.loadtxt(self.file, dtype=np.float32, delimiter=','))[
-                None, ...]  # (1,N,6)
+            values = np.loadtxt(self.file, dtype=np.float32, delimiter=',', ndmin=2)
+            if values.shape != (len(dataset), 6) or not np.isfinite(values).all():
+                raise ValueError('Perturbations must contain one finite six-vector per selected frame')
+            self.perturb = torch.from_numpy(values)[None, ...]  # (1,N,6)
         else:
             self.transform = transform.UniformTransformSE3(max_deg, max_tran, mag_randomly)
 

@@ -65,17 +65,15 @@ def statistics(values):
 
 
 def pipeline(batch, model, device, args, cfg):
-    # 从 dataset 提供的 CPU 图像 + 扰动点云开始。
-    # 在计时区间内重新生成深度，不使用 dataset 缓存的 uncalibed_depth_img。
+    # Start from prepared CPU inputs and project depth within the timed interval.
     rgb = batch['img'].to(device=device, dtype=torch.float32)
-    pcd = batch['uncalibed_pcd'].to(device=device, dtype=torch.float32).clone()
-    ranges = batch['pcd_range'].to(device=device, dtype=torch.float32)
+    pcd = batch['uncalibed_pcd'].to(device=device, dtype=torch.float32)
     intrinsic = batch['InTran'][0].to(device=device, dtype=torch.float32)
     depth = project_depth(pcd, intrinsic, rgb.shape[-2:], cfg['dataset']['pooling'])
     rgb_input, depth_input = prepare_inputs(rgb, depth, args)
     rotation, translation = model(rgb_input, depth_input)
     correction = torch.cat([rotation, translation], dim=1)
-    # GPU 上的 6-vector 是计时终点；矩阵转换、精度评估、可视化、保存、回 CPU 都在计时之外。
+    # The device-resident six-vector is the endpoint; metrics and output I/O are excluded.
     return correction, rgb_input, depth_input, depth
 
 
@@ -91,7 +89,7 @@ def evaluate(args, cfg, checkpoint, loader):
         if args.max_frames and index >= args.max_frames:
             break
         if index == 0:
-            # 预热整条 pipeline；不建图、不计时。
+            # Warm up the complete pipeline outside the timed intervals.
             for _ in range(args.warmup):
                 pipeline(batch, model, device, args, cfg)
             synchronize(device)
@@ -105,7 +103,7 @@ def evaluate(args, cfg, checkpoint, loader):
             if not torch.allclose(cached, projected_depth, rtol=1e-4, atol=1e-5):
                 raise ValueError('Dataset and runtime depth projection differ')
 
-        # 单独重放：E2E 内部不做任何中间同步。输入已在 device 上，包含拼接 6-vector。
+        # Replay the network separately using device-resident inputs, including concatenation.
         def network_only():
             rot, tsl = model(rgb_input, depth_input)
             return torch.cat([rot, tsl], dim=1)
@@ -160,6 +158,8 @@ def evaluate(args, cfg, checkpoint, loader):
             implementation_version=IMPLEMENTATION_VERSION,
             sequences=cfg['dataset']['test'],
             arguments=vars(args),
+            dataset_config=cfg['dataset'],
+            resize_ratio=checkpoint['args']['resize_ratio'],
             network_scope='Prepared device-resident Canny/Laplacian tensors to device-resident six-vector; includes concatenation; synchronized wall time.',
             pipeline_scope='Dataset-prepared CPU RGB/perturbed point cloud to device-resident six-vector; includes transfers, initial depth reprojection/pooling, CPU OpenCV Canny and transfers, Laplacian normalization and model.',
             exclusions='Dataset disk IO, decoding, resizing, sampling, synthetic perturbation generation, sensor acquisition/synchronization, output transfer to CPU, correction-matrix conversion, evaluation and visualization. Not raw-sensor-to-result latency.',
@@ -169,6 +169,22 @@ def evaluate(args, cfg, checkpoint, loader):
         json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps({k: report[k] for k in ['network', 'pipeline_e2e']}, indent=2))
     print(f'Results saved to {root}')
+
+
+def validate_evaluation_settings(checkpoint, args, cfg):
+    """Keep input construction consistent while permitting new test perturbations."""
+    if checkpoint.get('implementation_version') != IMPLEMENTATION_VERSION:
+        raise ValueError('Checkpoint architecture/objective version mismatch')
+    saved = checkpoint['args']
+    if saved.get('preprocessing_version') != PREPROCESSING_VERSION:
+        raise ValueError('Checkpoint preprocessing version mismatch')
+    for field in ('rgb_encoding', 'canny_low', 'canny_high'):
+        if saved.get(field) != getattr(args, field):
+            raise ValueError(f'{field} must match training checkpoint: {saved.get(field)!r}')
+    trained = checkpoint['config']['dataset']
+    for field in ('cam_id', 'voxel_size', 'pooling', 'extend_ratio'):
+        if cfg['dataset'].get(field) != trained.get(field):
+            raise ValueError(f'Dataset preprocessing must match training: {field}')
 
 
 def main():
@@ -184,20 +200,16 @@ def main():
     checkpoint = torch.load(args.pretrained, map_location='cpu', weights_only=False)
     saved = checkpoint['args']
 
-    if checkpoint.get('implementation_version') != IMPLEMENTATION_VERSION:
-        raise ValueError('Checkpoint architecture/objective version mismatch; use matching trained weights')
-    for field in ['rgb_encoding', 'canny_low', 'canny_high']:
-        if field in saved and getattr(args, field) != saved[field]:
-            raise ValueError(f'{field} must match training checkpoint: {saved[field]!r}')
-
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    validate_evaluation_settings(checkpoint, args, cfg)
 
     split = [str(s).zfill(2) for s in cfg['dataset']['test']]
     if not split:
         raise ValueError('No test sequences in config')
 
-    # 与训练口径一致：resize_ratio 用 checkpoint 里保存的值，extend_ratio/voxel/pooling 用 config。
+    # Use the saved image scale and validated dataset preprocessing settings.
     base = BaseKITTIDataset(
         args.dataset_path, 1, split, cfg['dataset']['cam_id'],
         frame_manifest=cfg['dataset'].get('frame_manifest'), skip_frame=args.skip_frame,
