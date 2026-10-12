@@ -65,53 +65,38 @@ class Aggregation(nn.Module):
 
 
 class OTF_CalibNet(nn.Module):
-    def __init__(self,backbone_pretrained=False,depth_scale=100.0):
-        super(OTF_CalibNet,self).__init__()
-        self.scale = depth_scale
-        self.rgb_resnet = (resnet22(inplanes=1,planes=64))  # outplanes = 512
-        self.depth_resnet = nn.Sequential(
-            nn.MaxPool2d(kernel_size=5,stride=1,padding=2),  # outplanes = 256
-            resnet22(inplanes=1,planes=32),
-        )
-        self.aggregation = Aggregation(inplanes=1024+512,planes=96)
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    def __init__(self, backbone_pretrained=False, depth_scale=1.0, backbone_checkpoint=None):
+        super().__init__()
+        self.rgb_resnet = resnet22(inplanes=1, planes=64)
+        self.depth_resnet = resnet22(inplanes=1, planes=32)
+        self.aggregation = Aggregation(inplanes=1024+512, planes=96)
+        # Inputs are already normalized Canny/Laplacian maps. No extra pooling
+        # or metric-depth scaling is performed inside the feature network.
         if backbone_pretrained:
-            self.rgb_resnet.load_state_dict(torch.load("resnetV1C.pth")['state_dict'],strict=False)
-        self.to(self.device)
+            if backbone_checkpoint is None:
+                raise ValueError("Provide the RGB backbone checkpoint explicitly")
+            self.load_rgb_backbone(backbone_checkpoint)
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-                nn.init.kaiming_normal_(m.weight.data, mode='fan_in',nonlinearity='relu')
-                if m.bias is not None:
-                    m.bias.data.zero_()
-        def reset_parameters(m):
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in')
-                if m.bias is not None:
-                    nn.init.zero_()
+    def load_rgb_backbone(self, path):
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        state = checkpoint.get("state_dict", checkpoint)
+        own = self.rgb_resnet.state_dict()
+        mapped = {}
+        for key, value in state.items():
+            for prefix in ("module.", "backbone.", "rgb_resnet."):
+                if key.startswith(prefix): key = key[len(prefix):]
+            if key == "stem.0.weight" and value.shape[1] == 3:
+                value = value.mean(1, keepdim=True)
+            if key in own and value.shape == own[key].shape:
+                mapped[key] = value
+        missing = [key for key in own if not key.startswith("layer5.")
+                   and not key.endswith("num_batches_tracked") and key not in mapped]
+        if missing:
+            raise ValueError("RGB checkpoint does not cover the base backbone: " + str(missing[:5]))
+        self.rgb_resnet.load_state_dict(mapped, strict=False)
+        # No subsequent initialization: the loaded RGB weights are preserved.
 
-        self.depth_resnet.apply(reset_parameters)
-    def forward(self,rgb:torch.Tensor,depth:torch.Tensor):
-        # rgb: [B,3,H,W]
-        # depth: [B,1,H,W]
-        x1,x2 = rgb,depth.clone()  # clone dpeth, or it will change depth in '/' operation
-        x2 /= self.scale
-        x1 = self.rgb_resnet(x1)[-1]
-        x2 = self.depth_resnet(x2)[-1]
-        feat = torch.cat((x1,x2),dim=1)  # [B,C1+C2,H,W]
-        x_rot, x_tr =  self.aggregation(feat)
-        return x_rot, x_tr
-
-
-
-if __name__=="__main__":
-    x = (torch.rand(1,2,1242,375).cuda(),torch.rand(1,2,1242,375).cuda())
-    model = OTF_CalibNet(backbone_pretrained=False).cuda()
-    model.eval()
-    rotation,translation = model(*x)
-#    print(rotation)
-#    print(translation)
-    print("translation size:{}".format(translation.size()))
-    print("rotation size:{}".format(rotation.size()))
-
-
+    def forward(self, rgb, depth):
+        rgb_features = self.rgb_resnet(rgb)[-1]
+        depth_features = self.depth_resnet(depth)[-1]
+        return self.aggregation(torch.cat((rgb_features, depth_features), dim=1))

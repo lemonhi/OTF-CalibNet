@@ -43,7 +43,7 @@ class BasicBlock(nn.Module):
         out = self.relu(out)
 
         return out
-    
+
 class ConvModule(nn.Module):
     def __init__(self,inplanes, planes, **kwargs):
         super(ConvModule,self).__init__()
@@ -55,7 +55,7 @@ class ConvModule(nn.Module):
         x = self.bn(x)
         out = self.activate(x)
         return out
-        
+
 class ASPPHead(nn.Module):
     def __init__(self,num_classes):
         super(ASPPHead,self).__init__()
@@ -64,7 +64,7 @@ class ASPPHead(nn.Module):
         self.image_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(output_size=1),
             ConvModule(512,128,kernel_size=1,stride=1,bias=False),
-            ) 
+            )
         self.aspp_modules = nn.ModuleList([
             ConvModule(512, 128, kernel_size=1,stride=1,bias=False),
             ConvModule(512, 128, kernel_size=3,stride=1,padding=12,dilation=12,bias=False),
@@ -154,13 +154,13 @@ class resnet22(nn.Module):
     def __init__(self, inplanes=3, planes=64):
         super(resnet22,self).__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(inplanes, 32, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(inplanes, planes//2, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(planes//2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(planes//2, planes//2, 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(planes//2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, planes, 3, stride=1, padding=1, bias=False),
+            nn.Conv2d(planes//2, planes, 3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(planes),
             nn.ReLU(inplace=True),
             )
@@ -237,7 +237,7 @@ class EncoderDecoder(nn.Module):
             return decode_seg, aux_seg
 
 # 加载预训练的 ResNet50 模型
-resnet50 = models.resnet50(pretrained=True)
+resnet50 = None  # Optional models are constructed explicitly, never at import.
 class CustomResNet50(nn.Module):
     def __init__(self, original_model):
         super(CustomResNet50, self).__init__()
@@ -290,4 +290,4 @@ if __name__ == "__main__":
 
 
 
-        
+

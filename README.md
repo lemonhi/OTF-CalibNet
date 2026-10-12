@@ -1,99 +1,140 @@
+# OTF-CalibNet: Single-Frame Extrinsic Refinement for Synchronous LiDAR-Camera Systems
 
-# OTF-CalibNet: On-the-fly Calibration Network for Synchronous LiDAR-Camera Systems
+OTF-CalibNet estimates a rotation correction and a translation correction from
+one synchronized image–point-cloud pair. It uses synthetic perturbations for
+supervised training. Inference uses one forward pass and no calibration target.
+Continuous physical sensor drift and embedded-platform performance are not evaluated.
 
-the code was implemented by Jiahui Chai for the paper OTF-CalibNet
-## Implemented Environment
+## Inputs and network
 
-Ubuntu 20.04
+The dataset and inference pipeline share camera-z depth projection followed by
+5×5 max pooling. RGB is converted to grayscale for Canny (thresholds 100/200).
+Depth features are absolute 2D Laplacian responses, normalized per image.
+Both input maps are single-channel and in [0,1]. There is no second depth
+scaling or feature-map pooling before the depth backbone.
 
-Pytorch 2.4.0
+The retained residual backbone uses a three-convolution stem, four base
+residual stages, and two additional residual blocks (four main convolutions).
+RGB/depth output channels are 1024/512; depth branch widths are halved.
+The current implementation contains 72,666,934 trainable parameters.
+This is the repository's custom ResNet-style implementation, not a drop-in
+`torchvision.resnet18`. Convolution and fully connected layers regress an
+axis-angle rotation vector (radians) and Cartesian translation (metres).
+Only the RGB branch accepts pretraining. Supply the actual compatible backbone
+checkpoint: pretrained weights are loaded after initialization and are not overwritten.
 
-CUDA 12.4
+## Objective
 
-Python 3.12.5
+`calibration_objective.py` implements:
 
-Intel i9 13900K CPU and NVIDIA GeForce RTX4090 GPU
+- `DepthGradientLoss`: sum of absolute differences of signed horizontal and
+  vertical depth derivatives, comparing corrected and reference depth maps.
+  RGB does not enter this loss. Sobel discretization is used for these derivatives;
+  it is separate from Canny/Laplacian input preprocessing.
+- `SquaredChamferLoss`: bidirectional sums of squared nearest-neighbour distances,
+  without a square root or coordinate rescaling. Chunked neighbour search limits
+  intermediate memory; runtime remains quadratic in the point count.
+- `DirectParameterLoss`: batch mean of the L1 sums over the predicted and target
+  rotation-vector and Cartesian-translation components. The target is the inverse
+  of the applied perturbation, not the forward disturbance.
 
-## Dataset Preparation
+Default weights are 0.3, 0.3, 0.4. Spatial and point sums are computed per sample,
+then averaged over the batch. A bilinear depth splat permits depth supervision
+to backpropagate to the correction. Overlapping contributions are averaged and
+camera-z values are used. The formulas do not specify the discrete rasterizer,
+Sobel stencil, or occlusion convention; these are explicit implementation choices.
 
-KITTI Odometry 
-http://www.cvlibs.net/datasets/kitti/eval_odometry.php
-Dataset Should be organized into data/ filefolder in our root:
-/PATH/TO/OTF-CalibNet/
-  --|data/
-      --|poses/
-          --|00.txt
-          --|01.txt
-          --...
-      --|sequences/
-          --|00/
-              --|image_2/
-              --|image_3/
-              --|velodyne/
-              --|calib.txt
-              --|times.txt
-          --|01/
-          --|02/
-          --...
-  --...
-## Train and Test
-### Train
+## Installation
 
-The following command is fit with a 24GB GPU.
+Use Python 3.12 with matching PyTorch 2.4.0 / torchvision 0.19.0 builds for your
+CUDA runtime. Install other dependencies with `pip install -r requirements.txt`.
+No model weights are downloaded at module import.
 
+## Dataset and configuration
+
+Organize KITTI odometry under `data/sequences/00`, ..., `data/sequences/21`,
+with each sequence containing `image_2`, `image_3`, `velodyne`, and `calib.txt`.
+`config.yml` selects 00–15 for training, 16–19 for validation, and 20–21 for testing.
+Reported pair counts are 31,176 / 9,004 / 3,553 (43,733 total).
+
+Sequence IDs alone do not identify the exact retained frames. Supply the original
+frame-selection JSON through `dataset.frame_manifest`, mapping zero-padded sequence
+IDs to original frame indices, e.g. `{"00": [0, 1, 4], "01": [2, 3]}`. The loader
+checks actual split counts and does not silently trim or duplicate data to reach
+the reported totals. `--allow_count_mismatch` explicitly allows diagnostic runs
+on a different subset. A sequence-aware sampler prevents mixed image sizes and
+keeps incomplete batches rather than dropping frames.
+
+The self-collected dataset is described as 13,923 pairs, split by acquisition
+sequence in a 7:2:1 ratio. Its raw files, exact split manifest, and calibration
+metadata are not included; this repository does not fabricate a substitute split.
+The reported 640×480 image size belongs to that acquisition system. KITTI image
+size follows the loaded files and explicit `--resize_ratio`.
+
+## Training
+
+```bash
+python train_otf.py --config config.yml --dataset_path ./data \
+  --backbone_checkpoint /path/to/rgb_backbone.pth \
+  --max_deg 10 --max_tran 0.25 --alpha 0.3 --beta 0.3 --gama 0.4
 ```
-python train_otf.py --config config.yml --dataset_path ./data --rgb_encoding zero_one
 
+Use `--from_scratch` only for a diagnostic run without RGB pretraining.
+Learning rate, epochs, point sampling and batch size are exposed as command-line
+settings; their defaults are implementation defaults, not verified historical
+experiment settings. Checkpoints include configuration, preprocessing settings,
+and `implementation_version`. Resume requires matching configuration.
+Old checkpoints are not automatically relabelled as compatible with this model
+and objective. Use matching weights and validate results before reporting them.
+
+## Evaluation and synchronized timing
+
+```bash
+python test_otf.py --config config.yml --dataset_path ./data \
+  --pretrained checkpoint/single_frame/best.pth --max_deg 10 --max_tran 0.25
 ```
-### Test
 
+For the smaller perturbation setting use `--max_deg 1 --max_tran 0.1`.
+The test split is read from configuration. All selected frames are processed
+unless `--max_frames` is explicitly supplied. CUDA is synchronized before and
+after each measured interval. Evaluation disables autograd and uses one forward pass.
+
+- Network timing: prepared device-resident input maps to the device-resident
+  six-component correction vector, including concatenation.
+- Calibration-pipeline timing: dataset-prepared CPU RGB and perturbed point cloud
+  to the same output, including transfers, projection, pooling and preprocessing.
+- Excluded: disk I/O, decoding, resizing, sampling, perturbation generation,
+  output transfer, correction-matrix conversion, metrics and visualization.
+
+The two intervals are measured separately. Their difference is not a direct
+measurement of preprocessing cost. Output files contain per-frame errors,
+latency samples, statistics, device/software metadata and actual evaluated counts.
+Rotation metrics use XYZ Euler-angle differences; translation metrics compare
+inverse-transform translations. Axis means and vector L2 means are reported
+separately. Euler convention and table aggregation must match the original
+experiment configuration for a controlled comparison.
+
+## Reported results
+
+| Initial perturbation | Mean rotation error | Mean translation error |
+| --- | --- | --- |
+| ±10°, ±25 cm | 0.193° | 2.87 cm |
+| ±1°, ±10 cm | 0.018° | 0.21 cm |
+
+Reported mean latencies are 15.27 ms for network inference and 24.76 ms for the
+calibration pipeline on the stated workstation. These are reported measurements,
+not results obtained by running this repository update. Architecture, projection,
+objective and input changes require matching checkpoints and fresh validation;
+the values above are not guaranteed by the code. Literature baselines are quoted
+from their publications and are not reproduced under a common protocol.
+
+## Checks
+
+```bash
+python -m unittest discover -s tests -v
 ```
-python test_otf.py --config config.yml --dataset_path ./data --pretrained ./checkpoint/MATCHING_CHECKPOINT.pth --rgb_encoding zero_one
-```
-Download pretrained `链接: https://pan.baidu.com/s/1YwY65gI1ywYRKmA1L_we4A?pwd=sk8u 提取码: sk8u` from here and put it into root/checkpoint/.
-## Shared input preprocessing
 
-Training, validation, and testing all call `prepare_inputs` in
-`otf_preprocessing.py`. RGB images are converted to grayscale and processed
-with OpenCV Canny (default thresholds 100 and 200, `L2gradient=True`).
-Depth maps are processed with the 3-by-3 Laplacian kernel
-`[[0,1,0],[1,-4,1],[0,1,0]]`; response magnitudes are normalized per image.
-Both returned tensors have shape `[B,1,H,W]` and values in `[0,1]`.
-The dataset applies depth pooling before feature extraction. The existing
-network's internal depth scaling and pooling are retained in this patch.
-The repository dataset uses PIL images with `ToTensor`, matching
-`--rgb_encoding zero_one`. Use matching preprocessing settings for training
-and evaluation. Install OpenCV using the added requirements entry.
-
-Both feature maps are passed to the network. Existing checkpoints must
-be checked for compatibility with these inputs before evaluation.
-New training checkpoints record `preprocessing_version` and Canny settings.
-Unverified checkpoints are rejected by default for evaluation and resume;
-`--allow_legacy_checkpoint` permits evaluation only as a diagnostic. Do not
-add a version tag to old weights without verifying their training provenance.
-
-The results below are historical examples. Reproduction requires their
-corresponding dataset splits, experiment configurations, and matching weights.
-The existing test timer is not a synchronized GPU latency benchmark.
-
-## Results on KITTI Odometry Test (Seq = 11, one iter)
-![](https://i-blog.csdnimg.cn/direct/bdbcb721534d426db180df9b14553c76.jpeg#pic_center)左上角为原始图像，右上角为gt外参进行可视化结果
-右下角为受扰动外参可视化结果，右下角为通过OTF-CalibNet网络标定后的可视化结果
-
-初始误差（±20°，±1.5m），去扰动标定后：
-Rotation (deg)： X:1.0896,		Y:3.7543,		Z:1.3395
-Translation (m)：X:0.03298,	Y:0.03586,		Z:0.03267
-
-初始误差（±10°，±0.2m），去扰动标定后：
-Rotation (deg)： X:0.159,		Y:0.328,		Z:0.315
-Translation (m)：X:0.0231,	Y:0.0224,		Z:0.0206
-
-初始误差（±2°，±0.2m），去扰动标定后：
-Rotation (deg)： X:0.17,		Y:0.27,		Z:0.12
-Translation (m)： X:0.025,	Y:0.0148,		Z:0.0320
-
-## Notice
-
- 1. 训练集需要提前自行下载； 
- 2. 在test中有可视化的相关部分，为了确保代码能顺利运行，新建部分文件夹即可；
-
+The tests check signed gradient supervision, the squared Chamfer formula,
+inverse-correction targets, preprocessing shapes, and nonzero depth-loss gradients.
+Full KITTI training, accuracy reproduction and GPU latency measurement require
+the original frame manifests, RGB weights and experiment settings.

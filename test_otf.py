@@ -1,282 +1,241 @@
+"""Single-frame accuracy and synchronized latency evaluation."""
 import argparse
-from otf_preprocessing import add_preprocessing_options, prepare_inputs, PREPROCESSING_VERSION
+import json
 import os
-
-import cv2
-import numpy
-import yaml
-import torch
-import pykitti
-import numpy as np
-import matplotlib
 import time
-
-matplotlib.use('agg')
-from matplotlib import pyplot as plt
-from torch.utils.data.dataloader import DataLoader
-from dataset import BaseKITTIDataset, KITTI_perturb
-from mylogger import get_logger, print_highlight, print_warning
-from OTF_CalibNet import *
-import loss as loss_utils
-import utils
+from pathlib import Path
 import numpy as np
-import scipy
-from scipy import linalg
-from torchvision.utils import save_image
+import torch
+import yaml
+from torch.utils.data import DataLoader
+from dataset import BaseKITTIDataset, KITTI_perturb
+from OTF_CalibNet import OTF_CalibNet
+from calibration_objective import correction_matrix, IMPLEMENTATION_VERSION
+from depth_projection import project_depth
+from scipy.spatial.transform import Rotation
+import utils
+from otf_preprocessing import add_preprocessing_options, prepare_inputs, PREPROCESSING_VERSION
 
 
-def options():
-    parser = argparse.ArgumentParser()
-    # dataset
-    parser.add_argument("--config", type=str, default='config.yml')
-    parser.add_argument("--dataset_path", type=str, default='../data')
-    parser.add_argument("--skip_frame", type=int, default=3, help='skip frame of dataset')
-    parser.add_argument("--pcd_sample", type=int, default=-1)  # -1 means total sample
-    parser.add_argument("--max_deg", type=float, default=10)  # 10deg in each axis  (see the paper)
-    parser.add_argument("--max_tran", type=float, default=0.2)  # 0.2m in each axis  (see the paper)
-    parser.add_argument("--mag_randomly", type=bool, default=True)
-    # dataloader
-    parser.add_argument("--batch_size", type=int, default=1, choices=[1],
-                        help='batch size of test dataloader must be 1')
-    parser.add_argument("--num_workers", type=int, default=12)
-    parser.add_argument("--pin_memory", type=bool, default=True,
-                        help='set it to False if your CPU memory is insufficient')
-    # schedule
-    parser.add_argument("--device", type=str, default='cuda:0')
-    parser.add_argument("--pretrained", type=str, default='./checkpoint/0.2-0.4-0.4(10,0.2)_input(gra&depth)_best.pth')
-    parser.add_argument("--log_dir", default='log/')
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoint/")
-    parser.add_argument("--res_dir", type=str, default='res/')
-    parser.add_argument("--name", type=str, default='')
-    # setting
-    parser.add_argument("--inner_iter", type=int, default=1, help='inner iter of calibnet')
-    # if CUDA is out of memory, please reduce batch_size, pcd_sample or inner_iter
-    add_preprocessing_options(parser)
-    parser.add_argument('--allow_legacy_checkpoint', action='store_true',
-                        help='Diagnostic only: permit weights with unverified preprocessing')
-    return parser.parse_args()
+def options(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument('--config', default='config.yml')
+    p.add_argument('--dataset_path', default='../data')
+    p.add_argument('--pretrained', default='./checkpoint/single_frame/best.pth')
+    p.add_argument('--device', default='cuda:0')
+    p.add_argument('--batch_size', type=int, choices=[1], default=1)
+    p.add_argument('--inner_iter', type=int, choices=[1], default=1, help='Single forward pass for the paper protocol')
+    p.add_argument('--num_workers', type=int, default=0)
+    p.add_argument('--skip_frame', type=int, default=1)
+    p.add_argument('--pcd_sample', type=int, default=-1)
+    p.add_argument('--max_deg', type=float, default=10)
+    p.add_argument('--max_tran', type=float, default=0.25)
+    p.add_argument('--mag_randomly', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--pin_memory', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--warmup', type=int, default=20)
+    p.add_argument('--max_frames', type=int, default=0, help='0: all frames; >0: explicit limit')
+    p.add_argument('--res_dir', default='res/single_frame')
+    p.add_argument('--perturb_file', default=None)
+    p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--allow_count_mismatch', action='store_true', help='Diagnostic frame subset')
+    add_preprocessing_options(p)
+    return p.parse_args(argv)
 
 
-def test(args, chkpt: dict, test_loader,total_time=0):
+def synchronize(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
 
-    model = OTF_CalibNet(depth_scale=args.scale)
+
+def timed_call(fn, device):
+    synchronize(device)  # drain previous GPU work BEFORE starting timer
+    t0 = time.perf_counter()
+    result = fn()
+    synchronize(device)  # wait for all submitted work BEFORE stopping timer
+    return result, (time.perf_counter() - t0) * 1000.0
+
+
+def statistics(values):
+    a = np.asarray(values, dtype=float)
+    if not a.size:
+        raise ValueError('No timed frames')
+    return dict(count=int(a.size), mean_ms=float(a.mean()), std_ms=float(a.std()),
+                median_ms=float(np.median(a)), p95_ms=float(np.percentile(a, 95)),
+                min_ms=float(a.min()), max_ms=float(a.max()))
+
+
+def pipeline(batch, model, device, args, cfg):
+    # 从 dataset 提供的 CPU 图像 + 扰动点云开始。
+    # 在计时区间内重新生成深度，不使用 dataset 缓存的 uncalibed_depth_img。
+    rgb = batch['img'].to(device=device, dtype=torch.float32)
+    pcd = batch['uncalibed_pcd'].to(device=device, dtype=torch.float32).clone()
+    ranges = batch['pcd_range'].to(device=device, dtype=torch.float32)
+    intrinsic = batch['InTran'][0].to(device=device, dtype=torch.float32)
+    depth = project_depth(pcd, intrinsic, rgb.shape[-2:], cfg['dataset']['pooling'])
+    rgb_input, depth_input = prepare_inputs(rgb, depth, args)
+    rotation, translation = model(rgb_input, depth_input)
+    correction = torch.cat([rotation, translation], dim=1)
+    # GPU 上的 6-vector 是计时终点；矩阵转换、精度评估、可视化、保存、回 CPU 都在计时之外。
+    return correction, rgb_input, depth_input, depth
+
+
+@torch.inference_mode()
+def evaluate(args, cfg, checkpoint, loader):
     device = torch.device(args.device)
-    model.to(device)
-    model.load_state_dict(chkpt['model'])
+    model = OTF_CalibNet(backbone_pretrained=False).to(device)
+    model.load_state_dict(checkpoint['model'])
     model.eval()
-    logger = get_logger('{name}-Test'.format(name=args.name), os.path.join(args.log_dir, args.name + '_test.log'),
-                        mode='w')
-    logger.debug(args)
-    res_npy = np.zeros([len(test_loader), 6])
-    print(len(test_loader))
-    num = 0
-    max_time=0
-    min_time=100
-    total_time=0
-    data = pykitti.odometry(base_path='../data', sequence='00')
-    calib = data.calib
-    for i, batch in enumerate(test_loader):
-        rgb_img = batch['img'].to(device)
-        B = rgb_img.size(0)
-        pcd_range = batch['pcd_range'].to(device)
-        uncalibed_pcd = batch['uncalibed_pcd'].to(device)
-        uncalibed_depth_img = batch['uncalibed_depth_img'].to(device)
-        uncalibed_dep_img = uncalibed_depth_img.detach().cpu().numpy()[0]
-        save_image(uncalibed_depth_img,'./depth_map/pic-{}.png'.format(i))
-        InTran = batch['InTran'][0].to(device)
-        igt = batch['igt'].to(device)
-        img_shape = rgb_img.shape[-2:]
-        depth_generator = utils.transform.DepthImgGenerator(img_shape, InTran, pcd_range, CONFIG['dataset']['pooling'])
-        Tcl = torch.eye(4).repeat(B, 1, 1).to(device)
-        uncalibed_pcd_temp = uncalibed_pcd
-        for j in range(args.inner_iter):
-
-            start_time = time.time()
-            rgb_input, depth_input = prepare_inputs(rgb_img, uncalibed_depth_img, args)
-            twist_rot, twist_tsl = model(rgb_input, depth_input)
-            iter_Tcl = utils.se3.exp(torch.cat([twist_rot, twist_tsl], dim=1))
-            uncalibed_depth_img, uncalibed_pcd_temp = depth_generator(iter_Tcl,uncalibed_pcd_temp)
-            Tcl = Tcl.bmm(iter_Tcl)
-            print(num,'Tcl',Tcl)
-            end_time = time.time()
-            a=end_time-start_time
-            if a<min_time:
-                min_time=a
-            if a>max_time:
-                max_time=a
-            print("单次时间",a)
-            total_time=total_time+a
-            print("平均单次时间：",total_time/(i+1))
-            print(num, 'Tcl', Tcl)
-        num = num + 1
-        uncalibed_pcd = uncalibed_pcd.cpu().detach().numpy().squeeze()
-        shape = uncalibed_pcd.shape
-        new_row = np.ones((1, shape[1]))
-        uncalibed_pcd = np.vstack([uncalibed_pcd, new_row])
-        print('i', i, 'igt', igt)
-        dg = Tcl.bmm(igt)
-        print(num, 'dg', dg)
-        rot_dx, tsl_dx = loss_utils.gt2euler(dg.squeeze(0).cpu().detach().numpy())
-        rot_dx = rot_dx.reshape(-1)
-        tsl_dx = tsl_dx.reshape(-1)
-        res_npy[i, :] = np.abs(np.concatenate([rot_dx, tsl_dx]))
-        print(res_npy[i, :].mean().item())
-
-        # extran1 = (calib.T_cam2_velo) * igt.detach().numpy()  # [4,4]
-        extran1 = Tcl.cpu().detach().numpy().squeeze()
-        extran = linalg.inv(igt.cpu().detach().numpy().squeeze())
-        intran = calib.K_cam2  # [3,3]
-        img = rgb_img.detach().cpu().numpy()[0]
-        H, W = img.shape[1:3]
-        print('H,w', H, W)
-        #        print(extran1.shape, intran.shape)
-        #        print(pcd.shape, img.shape)
-        #        pcd[-1, :] = 1.0
-        # 原RGB图
-
-        plt.figure(figsize=(15.5125, 4.7), dpi=80, tight_layout=True)
-        #plt.subplot(2, 2, 1)
-        img = img.transpose((1, 2, 0))
-        plt.imshow(img)
-        plt.axis('off')
-        plt.savefig('./1/pic-{}.png'.format(i),bbox_inches='tight', pad_inches=0)
-
-
-        # ground truth投影得到的
-        pcd3 = uncalibed_pcd.squeeze()
-        pcd3 = extran @ pcd3
-        pcd3 = intran @ pcd3[:3, :]
-        u2, v2, w2 = pcd3[0, :], pcd3[1, :], pcd3[2, :]
-        u2 = u2 / w2
-        v2 = v2 / w2
-        rev2 = (0 <= u2) * (u2 < W) * (0 <= v2) * (v2 < H) * (w2 > 0)
-        u2 = u2[rev2]
-        v2 = v2[rev2]
-        r2 = np.linalg.norm(pcd3[:, rev2], axis=0)
-        #plt.subplot(2, 2, 2)
-        plt.axis([0, W, H, 0])
-        #img = img.transpose((1, 2, 0))
-        plt.imshow(img)
-        #plt.title('B',fontsize='xx-large',fontweight='heavy')
-        plt.axis('off')
-        plt.scatter([u2], [v2], c=[r2], cmap='rainbow_r', alpha=0.5, s=2)
-        plt.subplots_adjust(top=1, bottom=0, left=0, right=1, hspace=0, wspace=0)
-        plt.savefig('./2/pic-{}.png'.format(i),bbox_inches='tight', pad_inches=0)
-
-        # 有干扰的点云不进行任何修正
-        pcd1 = uncalibed_pcd
-        # pcd1 = extran @ pcd1
-        pcd1 = pcd1.squeeze()
-        pcd1 = intran @ pcd1[:3, :]
-        u, v, w = pcd1[0, :], pcd1[1, :], pcd1[2, :]
-        u = u / w
-        v = v / w
-        rev = (0 <= u) * (u < W) * (0 <= v) * (v < H) * (w > 0)
-        u = u[rev]
-        v = v[rev]
-        r = np.linalg.norm(pcd1[:, rev], axis=0)
-        #plt.subplot(2, 2, 3)
-        plt.figure(figsize=(15.5125, 4.7), dpi=80, tight_layout=True)
-        plt.subplots_adjust(top=1, bottom=0, left=0, right=1, hspace=0, wspace=0)
-        plt.axis([0, W, H, 0])
-        plt.imshow(img)
-        #plt.title('C',fontsize='xx-large',fontweight='heavy')
-        plt.axis('off')
-        plt.scatter([u], [v], c=[r], cmap='rainbow_r', alpha=0.5, s=2)
-        plt.savefig('./3/pic-{}.png'.format(i),bbox_inches='tight', pad_inches=0)
-
-        # 利用预测的外参Tcl对uncalibed_pcd进行修正后的点云
-        pcd2 = uncalibed_pcd.squeeze()
-        pcd2 = extran1 @ pcd2
-        pcd2 = intran @ pcd2[:3, :]
-        u1, v1, w1 = pcd2[0, :], pcd2[1, :], pcd2[2, :]
-        u1 = u1 / w1
-        v1 = v1 / w1
-        rev1 = (0 <= u1) * (u1 < W) * (0 <= v1) * (v1 < H) * (w1 > 0)
-        u1 = u1[rev1]
-        v1 = v1[rev1]
-        r1 = np.linalg.norm(pcd2[:, rev1], axis=0)
-        #plt.subplot(2, 2, 4)
-        plt.figure(figsize=(15.5125, 4.7), dpi=80, tight_layout=True)
-        plt.axis([0, W, H, 0])
-        plt.imshow(img)
-        plt.axis('off')
-        plt.scatter([u1], [v1], c=[r1], cmap='rainbow_r', alpha=0.5, s=2)
-        plt.subplots_adjust(top=1, bottom=0, left=0, right=1, hspace=0, wspace=0)
-        plt.savefig('./4/pic-{}.png'.format(i),bbox_inches='tight', pad_inches=0)
-        plt.savefig('./img_total(inner_iter=1)/pic-{}.png'.format(i), bbox_inches='tight')
-        logger.info('[{:05d}|{:05d}],mrot:{:.4f},mtran:{:.4f}'.format(i + 1, len(test_loader), np.degrees(res_npy[i, :3].mean().item()),res_npy[i,3:].mean().item()))
-        logger.info(np.degrees(np.around(res_npy[i,:3],4)))
-        logger.info(np.around(res_npy[i,3:],4))
-        if i == 100:
+    records, errors = [], []
+    first_shape = None
+    for index, batch in enumerate(loader):
+        if args.max_frames and index >= args.max_frames:
             break
-    np.save(os.path.join(os.path.join(args.res_dir, '{name}.npy'.format(name=args.name))), res_npy)
-    logger.info('Angle error (deg): X:{:.4f},Y:{:.4f},Z:{:.4f}'.format(*np.degrees(np.mean(res_npy[:100, :3], axis=0))))
-    logger.info('Translation error (m): X:{:.4f},Y:{:.4f},Z:{:.4f}'.format(*np.mean(res_npy[:100, 3:], axis=0)))
-    logger.info(np.mean(np.degrees(np.mean(res_npy[:100,0:3]))))
-    logger.info(np.mean(np.mean(res_npy[:100,3:])))
-    print(max_time)
-    print(min_time)
+        if index == 0:
+            # 预热整条 pipeline；不建图、不计时。
+            for _ in range(args.warmup):
+                pipeline(batch, model, device, args, cfg)
+            synchronize(device)
 
-if __name__ == "__main__":
+        result, pipeline_ms = timed_call(lambda: pipeline(batch, model, device, args, cfg), device)
+        correction, rgb_input, depth_input, projected_depth = result
 
+        if index == 0:
+            first_shape = list(batch['img'].shape)
+            cached = batch['uncalibed_depth_img'].to(device)
+            if not torch.allclose(cached, projected_depth, rtol=1e-4, atol=1e-5):
+                raise ValueError('Dataset and runtime depth projection differ')
+
+        # 单独重放：E2E 内部不做任何中间同步。输入已在 device 上，包含拼接 6-vector。
+        def network_only():
+            rot, tsl = model(rgb_input, depth_input)
+            return torch.cat([rot, tsl], dim=1)
+
+        _, network_ms = timed_call(network_only, device)
+        records.append([index, network_ms, pipeline_ms])
+
+        transform = correction_matrix(correction[:, :3], correction[:, 3:])
+        target = torch.linalg.inv(batch['igt'].to(device))
+        pred_np, target_np = transform[0].cpu().numpy(), target[0].cpu().numpy()
+        pred_angles = Rotation.from_matrix(pred_np[:3,:3]).as_euler('xyz')
+        target_angles = Rotation.from_matrix(target_np[:3,:3]).as_euler('xyz')
+        delta_angles = pred_angles-target_angles
+        pred_center = -pred_np[:3,:3].T @ pred_np[:3,3]
+        target_center = -target_np[:3,:3].T @ target_np[:3,3]
+        errors.append(np.abs(np.concatenate((delta_angles,pred_center-target_center))))
+
+        if (index + 1) % 50 == 0:
+            print(f'Completed {index + 1} frames')
+
+    if not records:
+        raise ValueError('Empty evaluation dataset')
+
+    arr = np.asarray(records)
+    err = np.asarray(errors)
+    root = Path(args.res_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    np.save(root / 'errors.npy', err)
+    np.savetxt(root / 'latency.csv', arr, delimiter=',',
+               header='frame,network_ms,pipeline_e2e_ms', comments='')
+    report = dict(
+        network=statistics(arr[:, 1]),
+        pipeline_e2e=statistics(arr[:, 2]),
+        rotation_mae_deg_xyz=np.degrees(err[:, :3]).mean(axis=0).tolist(),
+        translation_mae_m_xyz=err[:, 3:].mean(axis=0).tolist(),
+        ARE_deg=float(np.degrees(err[:,:3]).mean()),
+        ATE_cm=float(100*err[:,3:].mean()),
+        rotation_l2_mean_rad=float(np.linalg.norm(err[:,:3],axis=1).mean()),
+        translation_l2_mean_m=float(np.linalg.norm(err[:,3:],axis=1).mean()),
+        metadata=dict(
+            device=str(device),
+            gpu=torch.cuda.get_device_name(device) if device.type == 'cuda' else None,
+            torch_version=torch.__version__,
+            cuda_version=torch.version.cuda,
+            opencv_version=__import__('cv2').__version__,
+            precision='FP32, no autocast',
+            warmup=args.warmup,
+            input_shape=first_shape,
+            inner_iter=1,
+            batch_size=1,
+            preprocessing_version=PREPROCESSING_VERSION,
+            implementation_version=IMPLEMENTATION_VERSION,
+            sequences=cfg['dataset']['test'],
+            arguments=vars(args),
+            network_scope='Prepared device-resident Canny/Laplacian tensors to device-resident six-vector; includes concatenation; synchronized wall time.',
+            pipeline_scope='Dataset-prepared CPU RGB/perturbed point cloud to device-resident six-vector; includes transfers, initial depth reprojection/pooling, CPU OpenCV Canny and transfers, Laplacian normalization and model.',
+            exclusions='Dataset disk IO, decoding, resizing, sampling, synthetic perturbation generation, sensor acquisition/synchronization, output transfer to CPU, correction-matrix conversion, evaluation and visualization. Not raw-sensor-to-result latency.',
+            timing='perf_counter with CUDA synchronization before/after each interval; network replay measured separately from pipeline; CPU has no CUDA sync.')
+    )
+    (root / 'latency_summary.json').write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(json.dumps({k: report[k] for k in ['network', 'pipeline_e2e']}, indent=2))
+    print(f'Results saved to {root}')
+
+
+def main():
     args = options()
-    if not torch.cuda.is_available():
-        args.device = 'cpu'
-        print_warning('CUDA is not available, use CPU to run')
-    os.makedirs(args.log_dir, exist_ok=True)
-    with open(args.config, 'r') as f:
-        CONFIG: dict = yaml.load(f, yaml.SafeLoader)
-    if os.path.exists(args.pretrained) and os.path.isfile(args.pretrained):
-        chkpt = torch.load(args.pretrained)
-        saved = chkpt['args']
-        if saved.get('preprocessing_version') != PREPROCESSING_VERSION:
-            if not args.allow_legacy_checkpoint:
-                raise ValueError('Checkpoint preprocessing is unverified. Use a matching checkpoint; '
-                                 '--allow_legacy_checkpoint is for diagnostics only.')
-            print_warning('Legacy checkpoint: accuracy is not validated for Canny/Laplacian inputs.')
-        for field in ('rgb_encoding', 'canny_low', 'canny_high'):
-            if field in saved and getattr(args, field) != saved[field]:
-                raise ValueError(f'{field} must match checkpoint value {saved[field]!r}')
-        CONFIG.update(chkpt['config'])
-        update_args = ['resize_ratio', 'name', 'scale']
-        for up_arg in update_args:
-            setattr(args, up_arg, chkpt['args'][up_arg])
+
+    if args.warmup < 0 or args.max_frames < 0:
+        raise ValueError('warmup and max_frames must be nonnegative')
+    if args.device.startswith('cuda') and not torch.cuda.is_available():
+        raise RuntimeError('CUDA unavailable; pass --device cpu for a CPU-only diagnostic, not GPU timing')
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    checkpoint = torch.load(args.pretrained, map_location='cpu', weights_only=False)
+    saved = checkpoint['args']
+
+    if checkpoint.get('implementation_version') != IMPLEMENTATION_VERSION:
+        raise ValueError('Checkpoint architecture/objective version mismatch; use matching trained weights')
+    for field in ['rgb_encoding', 'canny_low', 'canny_high']:
+        if field in saved and getattr(args, field) != saved[field]:
+            raise ValueError(f'{field} must match training checkpoint: {saved[field]!r}')
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    split = [str(s).zfill(2) for s in cfg['dataset']['test']]
+    if not split:
+        raise ValueError('No test sequences in config')
+
+    # 与训练口径一致：resize_ratio 用 checkpoint 里保存的值，extend_ratio/voxel/pooling 用 config。
+    base = BaseKITTIDataset(
+        args.dataset_path, 1, split, cfg['dataset']['cam_id'],
+        frame_manifest=cfg['dataset'].get('frame_manifest'), skip_frame=args.skip_frame,
+        voxel_size=cfg['dataset']['voxel_size'],
+        pcd_sample_num=args.pcd_sample,
+        resize_ratio=saved['resize_ratio'],
+        extend_ratio=cfg['dataset']['extend_ratio'])
+    expected = cfg['dataset']['expected_pairs']['test']
+    if len(base) != expected and not args.allow_count_mismatch:
+        raise ValueError(f'Loaded {len(base)} pairs, expected {expected}; supply the exact frame manifest')
+    if not len(base):
+        raise ValueError('Empty dataset')
+
+    Path(args.res_dir).mkdir(parents=True, exist_ok=True)
+
+    perturb_path = Path(args.perturb_file) if args.perturb_file else \
+        Path(args.res_dir) / ('perturb_' + '-'.join(split)
+                              + f'_{args.max_deg:g}deg_{args.max_tran:g}m_seed{args.seed}_n{len(base)}.csv')
+
+    if not perturb_path.exists():
+        perturb_path.parent.mkdir(parents=True, exist_ok=True)
+        generator = utils.transform.UniformTransformSE3(args.max_deg, args.max_tran, args.mag_randomly)
+        perturbations = np.stack(
+            [generator.generate_transform().cpu().numpy().reshape(6) for _ in range(len(base))])
+        np.savetxt(perturb_path, perturbations, delimiter=',')
     else:
-        raise FileNotFoundError('pretrained checkpoint {:s} not found!'.format(os.path.abspath(args.pretrained)))
-    print_highlight('args have been received, please wait for dataloader...')
+        existing = np.loadtxt(perturb_path, delimiter=',', ndmin=2)
+        if existing.shape != (len(base), 6):
+            raise ValueError('Existing perturbation file has wrong shape; '
+                             'provide a matching file rather than overwrite it')
 
-    test_split = [str(index).rjust(2, '0') for index in CONFIG['dataset']['test']]
-    test_dataset = BaseKITTIDataset(args.dataset_path, args.batch_size,['11'], CONFIG['dataset']['cam_id'],
-                                    skip_frame=args.skip_frame, voxel_size=CONFIG['dataset']['voxel_size'],
-                                    pcd_sample_num=args.pcd_sample, resize_ratio=args.resize_ratio,
-                                    extend_ratio=CONFIG['dataset']['extend_ratio']
-                                    )
-    os.makedirs(args.res_dir, exist_ok=True)
-    test_perturb_file = os.path.join(args.checkpoint_dir, "test_seq_10_0.2.csv")
-    test_length = len(test_dataset)
-    if not os.path.exists(test_perturb_file):
-        print_highlight("test pertub file dosen't exist, create one.")
-        transform = utils.transform.UniformTransformSE3(args.max_deg, args.max_tran, args.mag_randomly)
-        perturb_arr = np.zeros([test_length, 6])
-        for i in range(test_length):
-            perturb_arr[i, :] = transform.generate_transform().cpu().numpy()
-            perturb_arr[i,:]=np.around(perturb_arr[i,:],4)
-            print(perturb_arr[i, :])
-        np.savetxt(test_perturb_file, perturb_arr, delimiter=',')
-    else:  # check length
-        test_seq = np.loadtxt(test_perturb_file, delimiter=',')
-        if test_length != test_seq.shape[0]:
-            print_warning('Incompatiable test length {}!={}'.format(test_length, test_seq.shape[0]))
-            transform = utils.transform.UniformTransformSE3(args.max_deg, args.max_tran, args.mag_randomly)
-            perturb_arr = np.zeros([test_length, 6])
-            for i in range(test_length):
-                perturb_arr[i, :] = transform.generate_transform().cpu().numpy()
-            np.savetxt(test_perturb_file, perturb_arr, delimiter=',')
-            print_highlight('test perturb file rewritten.')
+    dataset = KITTI_perturb(base, args.max_deg, args.max_tran, args.mag_randomly,
+                            pooling_size=cfg['dataset']['pooling'],
+                            file=str(perturb_path))
+    loader = DataLoader(dataset, batch_size=1, shuffle=False,
+                        num_workers=args.num_workers, pin_memory=args.pin_memory)
+    evaluate(args, cfg, checkpoint, loader)
 
-    test_dataset = KITTI_perturb(test_dataset, args.max_deg, args.max_tran, args.mag_randomly,
-                                 pooling_size=CONFIG['dataset']['pooling'], file=test_perturb_file)
-    test_dataloader = DataLoader(test_dataset, args.batch_size, num_workers=0, pin_memory=args.pin_memory)
-    total_time=0
-    test(args, chkpt, test_dataloader)
+
+if __name__ == '__main__':
+    main()

@@ -1,361 +1,150 @@
+"""Single-frame supervised calibration training."""
 import argparse
-from otf_preprocessing import add_preprocessing_options, prepare_inputs, PREPROCESSING_VERSION
-from asyncio.log import logger
-import os
-import yaml
-import torch
-import torch.optim
-import torch.nn as nn
-from torch.utils.data.dataloader import DataLoader
-from dataset import BaseKITTIDataset,KITTI_perturb
-from mylogger import get_logger, print_highlight, print_warning
-from OTF_CalibNet import OTF_CalibNet
-import loss as loss_utils
-import utils
-from tqdm import tqdm
+import json
+from pathlib import Path
 import numpy as np
-from utils.transform import UniformTransformSE3
-import matplotlib
-matplotlib.use('Agg')
-from matplotlib import pyplot as plt
-import torch.nn.functional as F
+import torch
+import yaml
+from torch.utils.data import DataLoader, Sampler
+from dataset import BaseKITTIDataset, KITTI_perturb
+from OTF_CalibNet import OTF_CalibNet
+from otf_preprocessing import add_preprocessing_options, prepare_inputs, PREPROCESSING_VERSION
+from calibration_objective import CalibrationObjective, correction_matrix, IMPLEMENTATION_VERSION
+from depth_projection import project_depth
+
+
+class SequenceBatchSampler(Sampler):
+    """Keep image sizes/intrinsics homogeneous without discarding frames."""
+    def __init__(self, lengths, batch_size, shuffle):
+        self.lengths, self.batch_size, self.shuffle = lengths, batch_size, shuffle
+    def __len__(self):
+        return sum((n+self.batch_size-1)//self.batch_size for n in self.lengths)
+    def __iter__(self):
+        batches, offset = [], 0
+        for n in self.lengths:
+            ids = torch.randperm(n).tolist() if self.shuffle else list(range(n))
+            batches.extend([[offset+i for i in ids[j:j+self.batch_size]]
+                            for j in range(0,n,self.batch_size)])
+            offset += n
+        if self.shuffle:
+            batches = [batches[i] for i in torch.randperm(len(batches)).tolist()]
+        yield from batches
+
 
 def options():
-    parser = argparse.ArgumentParser()
-    # dataset
-    parser.add_argument("--config",type=str,default='config.yml')
-    parser.add_argument("--dataset_path",type=str,default='../data/')
-    parser.add_argument("--skip_frame",type=int,default=3,help='skip frame of dataset')
-    parser.add_argument("--pcd_sample",type=int,default=30000)
-    parser.add_argument("--max_deg",type=float,default=10)  # 10deg in each axis  (see the paper)
-    parser.add_argument("--max_tran",type=float,default=0.2)   # 0.2m in each axis  (see the paper)
-    parser.add_argument("--mag_randomly",type=bool,default=True)
-    # dataloader
-    parser.add_argument("--batch_size",type=int,default=16)
-    parser.add_argument("--num_workers",type=int,default=8)
-    parser.add_argument("--pin_memory",type=bool,default=True,help='set it to False if your CPU memory is insufficient')
-    # schedule
-    parser.add_argument("--device",type=str,default='cuda:0')
-    parser.add_argument("--resume",type=str,default='')
-    parser.add_argument("--pretrained",type=str,default='checkpoint/0.2-0.4-0.4(10,0.2)_input(gra&depth)_Ablation')
-    parser.add_argument("--epoch",type=int,default=100)
-    parser.add_argument("--log_dir",default='log/')
-    parser.add_argument("--checkpoint_dir",type=str,default="checkpoint/")
-    parser.add_argument("--name",type=str,default='0.2-0.4-0.4(10,0.2)_input(gra&depth)_Ablation')
-    parser.add_argument("--optim",type=str,default='adam',choices=['sgd','adam'])
-    parser.add_argument("--lr0",type=float,default=1e-5)
-    parser.add_argument("--gamma",type=float,default=0.99)
-    parser.add_argument("--momentum",type=float,default=0.9)
-    parser.add_argument("--weight_decay",type=float,default=1e-4)
-    parser.add_argument("--lr_exp_decay",type=float,default=0.98)
-    parser.add_argument("--clip_grad",type=float,default=1.0)
-    # setting
-    parser.add_argument("--scale",type=float,default=50.0,help='scale factor of zhehzpcd normlization in loss')
-    parser.add_argument("--inner_iter",type=int,default=1,help='inner iter of calibnet')
-    parser.add_argument("--alpha",type=float,default=0.2,help='weight of gradient loss')
-    parser.add_argument("--beta",type=float,default=0.4,help='weight of chamfer loss')
-    parser.add_argument("--gama", type=float, default=0.4,help='weight of rt loss')
-    parser.add_argument("--resize_ratio",type=float,nargs=2,default=[1.0,1.0])
-    # if CUDA is out of memory, please reduce batch_size, pcd_sample or inner_iter
-    add_preprocessing_options(parser)
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--config', default='config.yml')
+    p.add_argument('--dataset_path', default='./data')
+    p.add_argument('--device', default='cuda:0')
+    p.add_argument('--batch_size', type=int, default=8)
+    p.add_argument('--num_workers', type=int, default=0)
+    p.add_argument('--epoch', type=int, default=50)
+    p.add_argument('--lr0', type=float, default=1e-4)
+    p.add_argument('--weight_decay', type=float, default=1e-4)
+    p.add_argument('--pcd_sample', type=int, default=4096)
+    p.add_argument('--skip_frame', type=int, default=1)
+    p.add_argument('--resize_ratio', type=float, nargs=2, default=[1.,1.])
+    p.add_argument('--max_deg', type=float, default=10.)
+    p.add_argument('--max_tran', type=float, default=.25)
+    p.add_argument('--alpha', type=float, default=.3)
+    p.add_argument('--beta', type=float, default=.3)
+    p.add_argument('--gama', type=float, default=.4)
+    p.add_argument('--inner_iter', type=int, choices=[1], default=1)
+    p.add_argument('--backbone_checkpoint', default=None)
+    p.add_argument('--from_scratch', action='store_true', help='Diagnostic training without RGB pretraining')
+    p.add_argument('--resume', default=None)
+    p.add_argument('--checkpoint_dir', default='checkpoint/single_frame')
+    p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--allow_count_mismatch', action='store_true', help='Diagnostic use of a different frame subset')
+    add_preprocessing_options(p)
+    return p.parse_args()
 
 
-@torch.no_grad()
-def val(args,model:OTF_CalibNet,val_loader:DataLoader):
-    model.eval()
-    device = model.device
-    tqdm_console = tqdm(total=len(val_loader),desc='Val')
-    photo_loss = loss_utils.Photo_Loss(args.scale)
-    chamfer_loss = loss_utils.ChamferDistanceLoss(args.scale,'mean')
-    gradient_loss = loss_utils.GradientDifferenceLoss(scale=1.0, reduction='mean')
-    rt_loss = loss_utils.RTLoss()
-    alpha = float(args.alpha)
-    beta = float(args.beta)
-    gama = float(args.gama)
-    total_dR = 0
-    total_dT = 0
-    total_loss = 0
-    total_se3_loss = 0
-    with tqdm_console:
-        tqdm_console.set_description_str('Val')
-        for batch in val_loader:
-            rgb_img = batch['img'].to(device)
-            B = rgb_img.size(0)
-            pcd_range = batch['pcd_range'].to(device)
-            calibed_depth_img = batch['depth_img'].to(device)
-            calibed_pcd = batch['pcd'].to(device)
-            uncalibed_pcd = batch['uncalibed_pcd'].to(device)
-            uncalibed_depth_img = batch['uncalibed_depth_img'].to(device)
-            InTran = batch['InTran'][0].to(device)
-            igt = batch['igt'].to(device)
-            img_shape = rgb_img.shape[-2:]
-            depth_generator = utils.transform.DepthImgGenerator(img_shape,InTran,pcd_range,CONFIG['dataset']['pooling'])
-            g0 = torch.eye(4).repeat(B,1,1).to(device)
-            for _ in range(args.inner_iter):
-                rgb_gradient, depth_gradient = prepare_inputs(rgb_img, uncalibed_depth_img, args)
-                twist_rot, twist_tsl = model(rgb_gradient, depth_gradient)
-                extran = utils.se3.exp(torch.cat([twist_rot,twist_tsl],dim=1))
-                uncalibed_depth_img, uncalibed_pcd = depth_generator(extran,uncalibed_pcd)
-                g0 = extran.bmm(g0)
-            err_g = g0.bmm(igt)
-            dR,dT = loss_utils.geodesic_distance(err_g)
-            total_dR += dR.item()
-            total_dT += dT.item()
-            se3_loss = torch.linalg.norm(utils.se3.log(err_g),dim=1).mean()/6
-            total_se3_loss += se3_loss.item()
-            loss1 = photo_loss(calibed_depth_img,uncalibed_depth_img)
-            loss2 = chamfer_loss(calibed_pcd,uncalibed_pcd)
-            loss3 = (dR+dT)
-            loss4 = (gradient_loss(calibed_depth_img,uncalibed_depth_img))
-            loss = alpha*loss4 + loss2*beta +loss3*gama
-            total_loss += loss.item()
-            logger.info('dR:{:.4f}, dT:{:.4f},d_direct:{:.4f},d_gradient:{:.4f},d_loss_total:{:.4f},se3_loss:{:.4f}'.format(loss1,loss2,loss3,loss4,total_loss,se3_loss))
-            tqdm_console.update(1)
-    total_dR /= len(val_loader)
-    total_dT /= len(val_loader)
-    total_loss /= len(val_loader)
-    total_se3_loss /= len(val_loader)
-    tqdm_console.set_postfix_str(
-        "total_dR:{:.4f}, total_dT:{:.4f},total_loss:{:.4f},total_se3_loss:{:.4f}".format(float(total_dR),
-                                                                                        float(total_dT),
-                                                                                        float(total_loss),
-                                                                                        float(total_se3_loss),
-                                                                                     ))
-
-    tqdm_console.update(1)
-
-    return total_loss, total_dR, total_dT, total_se3_loss
-
-# 确保路径存在，如果不存在则创建
-def ensure_dir(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)# 确保路径存在，如果不存在则创建
-def ensure_dir(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+def make_loader(args, cfg, split, shuffle):
+    settings = cfg['dataset']
+    base = BaseKITTIDataset(args.dataset_path, args.batch_size,
+        [str(s).zfill(2) for s in settings[split]], settings['cam_id'],
+        frame_manifest=settings.get('frame_manifest'), skip_frame=args.skip_frame,
+        voxel_size=settings['voxel_size'], pcd_sample_num=args.pcd_sample,
+        resize_ratio=args.resize_ratio, extend_ratio=settings['extend_ratio'])
+    expected = settings['expected_pairs'][split]
+    if len(base) != expected and not args.allow_count_mismatch:
+        raise ValueError(f'{split}: {len(base)} loaded pairs, expected {expected}. Supply the exact frame manifest; '
+                         '--allow_count_mismatch is for diagnostic runs only.')
+    dataset = KITTI_perturb(base,args.max_deg,args.max_tran,True,pooling_size=settings['pooling'])
+    if not shuffle:
+        # Fixed validation perturbations, independent of the training RNG stream.
+        with torch.random.fork_rng():
+            torch.manual_seed(args.seed+1)
+            samples = [dataset.transform.generate_transform().reshape(6) for _ in range(len(base))]
+        dataset.file = '<fixed validation perturbations>'
+        dataset.perturb = torch.stack(samples)[None]
+    sampler = SequenceBatchSampler(base.sep,args.batch_size,shuffle)
+    return DataLoader(dataset,batch_sampler=sampler,num_workers=args.num_workers)
 
 
-
-def train(args,chkpt,train_loader:DataLoader,val_loader:DataLoader):
-    device = torch.device(args.device)
-    model = OTF_CalibNet(backbone_pretrained=False,depth_scale=args.scale)
-    model.to(device)
-    # 创建文件夹
-    depth_img_dir = 'depth_map'
-    uncalib_depth_img_dir = './uncalib_depth_images'
-    ensure_dir(depth_img_dir)
-    ensure_dir(uncalib_depth_img_dir)
-    if args.optim == 'sgd':
-        optimizer = torch.optim.SGD(model.parameters(),args.lr0,momentum=args.momentum,weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.Adam(model.parameters(),args.lr0,weight_decay=args.weight_decay)
-    #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer,gamma=args.lr_exp_decay)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.gamma)
-    #scheduler = torch.optim.ReduceLROnPlateau(optimizer, 'min')
-    if args.pretrained:
-        if os.path.exists(args.pretrained) and os.path.isfile(args.pretrained):
-            model.load_state_dict(torch.load(args.pretrained)['model'])
-            print_highlight('Pretrained model loaded from {:s}'.format(args.pretrained))
-        else:
-            print_warning('Invalid pretrained path: {:s}'.format(args.pretrained))
-    if chkpt is not None:
-        model.load_state_dict(chkpt['model'])
-        optimizer.load_state_dict(chkpt['optimizer'])
-        scheduler.load_state_dict(chkpt['scheduler'])
-        start_epoch = chkpt['epoch'] + 1
-        min_loss = chkpt['min_loss']
-        log_mode = 'a'
-    else:
-        start_epoch = 0
-        min_loss = float('inf')
-        log_mode = 'w'
-    if not torch.cuda.is_available():
-        args.device = 'cpu'
-        print_warning('CUDA is not available, use CPU to run')
-    log_mode = 'a' if chkpt is not None else 'w'
-    logger = get_logger("{name}|Train".format(name=args.name),os.path.join(args.log_dir,args.name+'.log'),mode=log_mode)
-    if chkpt is None:
-        logger.debug(args)
-        print_highlight('Start Training')
-    else:
-        print_highlight('Resume from epoch {:d}'.format(start_epoch+1))
-    del chkpt  # free memory
-    photo_loss = loss_utils.Photo_Loss(args.scale)
-    chamfer_loss = loss_utils.ChamferDistanceLoss(args.scale,'mean')
-    rt_loss = loss_utils.RTLoss()
-    gradient_loss = loss_utils.GradientDifferenceLoss(scale=1.0, reduction='mean')
-    alpha = float(args.alpha)
-    beta = float(args.beta)
-    gama = float(args.gama)
-    for epoch in range(start_epoch,args.epoch):
-        model.train()
-        tqdm_console = tqdm(total=len(train_loader),desc='Train')
-        total_photo_loss = 0
-        total_chamfer_loss = 0
-        total_rt_loss=0
-        total_gradient_loss=0
-        has_nan = False  # 用于检查是否有NaN损失
-
-        with tqdm_console:
-            tqdm_console.set_description_str('Epoch: {:03d}|{:03d}'.format(epoch+1,args.epoch))
-            for batch_idx,batch in enumerate(train_loader):
-                optimizer.zero_grad()
-                rgb_img = batch['img'].to(device)
-                B = rgb_img.size(0)
-                pcd_range = batch['pcd_range'].to(device)
-                calibed_depth_img = batch['depth_img'].to(device)
-                calibed_pcd = batch['pcd'].to(device)
-                uncalibed_pcd = batch['uncalibed_pcd'].to(device)
-                uncalibed_depth_img = batch['uncalibed_depth_img'].to(device)
-                InTran = batch['InTran'][0].to(device)
-                igt = batch['igt'].to(device)
-                # 保存depth_img和uncalib_depth_img
-                # for i in range(B):
-                #     # 将张量移至CPU并转换为NumPy数组
-                #     calibed_depth_img_2d = calibed_depth_img[i].cpu().numpy().squeeze()
-                #     uncalibed_depth_img_2d = uncalibed_depth_img[i].cpu().numpy().squeeze()
-
-                img_shape = rgb_img.shape[-2:]
-                depth_generator = utils.transform.DepthImgGenerator(img_shape,InTran,pcd_range,CONFIG['dataset']['pooling'])
-                Tcl = torch.eye(4).repeat(B,1,1).to(device)
-
-                # model.eval()
-                for _ in range(args.inner_iter):
-                    rgb_gradient, depth_gradient = prepare_inputs(rgb_img, uncalibed_depth_img, args)
-                    twist_rot, twist_tsl = model(rgb_gradient, depth_gradient)
-                    iter_Tcl = utils.se3.exp(torch.cat([twist_rot, twist_tsl], dim=1))
-                    uncalibed_depth_img, uncalibed_pcd = depth_generator(iter_Tcl, uncalibed_pcd)
-                    Tcl = Tcl.bmm(iter_Tcl)
-
-                dR,dT = (loss_utils.geodesic_distance(Tcl.bmm(igt)))
-                # model.train()
-                loss1 = (photo_loss(calibed_depth_img,uncalibed_depth_img))
-                loss4 = (gradient_loss(calibed_depth_img,uncalibed_depth_img))
-                loss2 = (chamfer_loss(calibed_pcd,uncalibed_pcd))
-                loss3 = (dR + dT)
-                loss =  alpha*loss4 + beta*loss2+ gama*loss3
-                loss.backward()
-                nn.utils.clip_grad_value_(model.parameters(),args.clip_grad)
+def run_epoch(model, loader, objective, optimizer, device, args, cfg):
+    model.train(optimizer is not None)
+    totals = torch.zeros(4,device=device)
+    count = 0
+    with torch.set_grad_enabled(optimizer is not None):
+        for batch in loader:
+            rgb, depth = batch['img'].to(device), batch['uncalibed_depth_img'].to(device)
+            rotation, translation = model(*prepare_inputs(rgb,depth,args))
+            matrix = correction_matrix(rotation,translation)
+            cloud = batch['uncalibed_pcd'].to(device)
+            corrected = matrix[:,:3,:3] @ cloud + matrix[:,:3,3,None]
+            corrected_depth = project_depth(corrected,batch['InTran'].to(device),rgb.shape[-2:],cfg['dataset']['pooling'])
+            total, terms = objective(rotation,translation,batch['igt'].to(device),
+                corrected_depth,batch['depth_img'].to(device),corrected,batch['pcd'].to(device))
+            if not torch.isfinite(total): raise FloatingPointError('Non-finite training objective')
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(),1.)
                 optimizer.step()
-                tqdm_console.set_postfix_str("p:{:.4f}, c:{:.4f},direct:{:.4f},gradient:{:.4f}, dR:{:.4f}, dT:{:.4f}".format(float(loss1.item()),float(loss2.item()),float(loss3.item()),float(loss4.item()),float(dR.item()),float(dT.item())))
-                tqdm_console.update()
-                total_photo_loss += loss1.item()
-                total_chamfer_loss += loss2.item()
-                total_rt_loss += loss3.item()
-                total_gradient_loss += loss4.item()
-        # N_loader = len(train_loader)
-        # total_photo_loss /= N_loader
-        # total_chamfer_loss /= N_loader
-        total_loss =  (alpha*total_gradient_loss + beta*total_chamfer_loss + gama*total_rt_loss)/len(train_loader)
-        tqdm_console.set_postfix_str("loss: {:.3f}, photo: {:.3f}, chamfer: {:.3f}".format(float(total_loss),float(total_photo_loss),float(total_chamfer_loss)))
-        tqdm_console.update()
-        tqdm_console.close()
-        logger.info('Epoch {:03d}|{:03d}, train loss:{:.4f}'.format(epoch+1,args.epoch,total_loss))
-        scheduler.step()
-        val_loss, loss_dR, loss_dT, loss_se3 = val(args,model,val_loader)  # float 
-        if loss_se3 < min_loss:
-            min_loss = loss_se3
-            torch.save(dict(
-                model=model.state_dict(),
-                optimizer=optimizer.state_dict(),
-                scheduler=scheduler.state_dict(),
-                min_loss=min_loss,
-                epoch=epoch,
-                args=args.__dict__,
-                config=CONFIG
-            ),os.path.join(args.checkpoint_dir,'{name}_best.pth'.format(name=args.name)))
-            logger.debug('Best model saved (Epoch {:d})'.format(epoch+1))
-            print_highlight('Best Model (Epoch %d)'%(epoch+1))
-            logger.info("val_loss: {:.6f}".format(val_loss))
-            logger.info("loss_se3: {:.6f}".format(loss_se3))
+            n = rgb.shape[0]
+            totals += torch.stack((total,*terms)).detach()*n
+            count += n
+    return (totals/count).cpu().tolist()
 
-        torch.save(dict(
-                model=model.state_dict(),
-                optimizer=optimizer.state_dict(),
-                scheduler=scheduler.state_dict(),
-                min_loss=min_loss,
-                epoch=epoch,
-                args=args.__dict__,
-                config=CONFIG
-            ),os.path.join(args.checkpoint_dir,'{name}_last.pth'.format(name=args.name)))
-        logger.info('Evaluate loss_dR:{:.6f}, loss_dT:{:.6f}, se3_loss:{:.6f}'.format(loss_dR,loss_dT,loss_se3))
-            
-            
-            
 
-if __name__ == "__main__":
-    if torch.cuda.is_available():
-        device = torch.device('cuda')  # 使用 GPU
-    else:
-        device = torch.device('cpu')  # 使用 CPU
+def main():
     args = options()
-    args.preprocessing_version = PREPROCESSING_VERSION
-    os.makedirs(args.log_dir,exist_ok=True)
-    os.makedirs(args.checkpoint_dir,exist_ok=True)
-    with open(args.config,'r')as f:
-        CONFIG = yaml.load(f,yaml.SafeLoader)
-    assert isinstance(CONFIG,dict), 'Unknown config format!'
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    if not args.resume and not args.backbone_checkpoint and not args.from_scratch:
+        raise ValueError('Provide --backbone_checkpoint for RGB pretraining; --from_scratch is diagnostic only.')
+    with open(args.config) as f: cfg=yaml.safe_load(f)
+    device=torch.device(args.device)
+    model=OTF_CalibNet(backbone_pretrained=bool(args.backbone_checkpoint),
+                      backbone_checkpoint=args.backbone_checkpoint).to(device)
+    optimizer=torch.optim.Adam(model.parameters(),lr=args.lr0,weight_decay=args.weight_decay)
+    start,best=0,float('inf')
     if args.resume:
-        chkpt = torch.load(args.resume,map_location='cpu')
-        if chkpt['args'].get('preprocessing_version') != PREPROCESSING_VERSION:
-            raise ValueError('Resume checkpoint uses unverified preprocessing; verify its provenance before reuse.')
-        CONFIG.update(chkpt['config'])
-        args.__dict__.update(chkpt['args'])
-        print_highlight('config updated from resumed checkpoint {:s}'.format(args.resume))
-    else:
-        chkpt = None
-    print_highlight('args have been received, please wait for dataloader...')
-    train_split = [str(index).rjust(2,'0') for index in CONFIG['dataset']['train']]
-    val_split = [str(index).rjust(2,'0') for index in CONFIG['dataset']['val']]
-    # dataset
-    train_dataset = BaseKITTIDataset(args.dataset_path,args.batch_size,train_split,CONFIG['dataset']['cam_id'],
-                                     skip_frame=args.skip_frame,voxel_size=CONFIG['dataset']['voxel_size'],
-                                     pcd_sample_num=args.pcd_sample,resize_ratio=args.resize_ratio,
-                                     extend_ratio=CONFIG['dataset']['extend_ratio'])
-    train_dataset = KITTI_perturb(train_dataset,args.max_deg,args.max_tran,args.mag_randomly,
-                                  pooling_size=CONFIG['dataset']['pooling'])
-    
-    val_dataset = BaseKITTIDataset(args.dataset_path,args.batch_size,val_split,CONFIG['dataset']['cam_id'],
-                                     skip_frame=args.skip_frame,voxel_size=CONFIG['dataset']['voxel_size'],
-                                     pcd_sample_num=args.pcd_sample,resize_ratio=args.resize_ratio,
-                                     extend_ratio=CONFIG['dataset']['extend_ratio'])
+        saved=torch.load(args.resume,map_location='cpu',weights_only=False)
+        if saved.get('implementation_version')!=IMPLEMENTATION_VERSION:
+            raise ValueError('Checkpoint architecture/objective version mismatch')
+        for key in ('rgb_encoding','canny_low','canny_high','alpha','beta','gama','resize_ratio','max_deg','max_tran','pcd_sample'):
+            if saved['args'].get(key)!=getattr(args,key): raise ValueError(f'Resume setting differs: {key}')
+        if saved['config']!=cfg: raise ValueError('Resume dataset configuration differs')
+        model.load_state_dict(saved['model']);optimizer.load_state_dict(saved['optimizer'])
+        start=saved['epoch']+1;best=saved['best']
+    objective=CalibrationObjective((args.alpha,args.beta,args.gama))
+    train=make_loader(args,cfg,'train',True);val=make_loader(args,cfg,'val',False)
+    root=Path(args.checkpoint_dir);root.mkdir(parents=True,exist_ok=True)
+    args.preprocessing_version=PREPROCESSING_VERSION
+    print(json.dumps({'parameters':sum(p.numel() for p in model.parameters()),'train_pairs':len(train.dataset),
+                      'val_pairs':len(val.dataset),'arguments':vars(args)},indent=2))
+    for epoch in range(start,args.epoch):
+        tr=run_epoch(model,train,objective,optimizer,device,args,cfg)
+        va=run_epoch(model,val,objective,None,device,args,cfg)
+        improved=va[0]<best;best=min(best,va[0])
+        state=dict(model=model.state_dict(),optimizer=optimizer.state_dict(),epoch=epoch,best=best,
+                   args=vars(args),config=cfg,implementation_version=IMPLEMENTATION_VERSION)
+        torch.save(state,root/'last.pth')
+        if improved:torch.save(state,root/'best.pth')
+        with (root/'training.jsonl').open('a') as f:
+            f.write(json.dumps({'epoch':epoch,'train_total_grad_cd_direct':tr,'val_total_grad_cd_direct':va})+'\n')
+        print(epoch,tr,va)
 
-    val_perturb_file = os.path.join(args.checkpoint_dir,"val_seq.csv")
-
-    train_length = len(train_dataset)
-    val_length = len(val_dataset)
-    print(train_length,val_length)
-
-    if not os.path.exists(val_perturb_file):
-        print_highlight("validation pertub file dosen't exist, create one.")
-        transform = UniformTransformSE3(args.max_deg,args.max_tran,args.mag_randomly)
-        perturb_arr = np.zeros([val_length,6])
-        for i in range(val_length):
-            perturb_arr[i,:] = transform.generate_transform().cpu().numpy()
-        np.savetxt(val_perturb_file,perturb_arr,delimiter=',')
-    else:  # check length
-        val_seq = np.loadtxt(val_perturb_file,delimiter=',')
-        if val_length != val_seq.shape[0]:
-            print_warning('Incompatiable validation length {}!={}'.format(val_length,val_seq.shape[0]))
-            transform = utils.transform.UniformTransformSE3(args.max_deg,args.max_tran,args.mag_randomly)
-            perturb_arr = np.zeros([val_length,6])
-            for i in range(val_length):
-                perturb_arr[i,:] = transform.generate_transform().cpu().numpy()
-            np.savetxt(val_perturb_file,perturb_arr,delimiter=',')
-            print_highlight('Validation perturb file rewritten.')
-
-    val_dataset = KITTI_perturb(val_dataset,args.max_deg,args.max_tran,args.mag_randomly,
-                                pooling_size=CONFIG['dataset']['pooling'],
-                                file=os.path.join(args.checkpoint_dir,"val_seq.csv"))
-
-    # batch normlization does not support batch=1
-    train_drop_last = True if len(train_dataset) % args.batch_size == 1 else False  
-    val_drop_last = True if len(val_dataset) % args.batch_size == 1 else False
-
-    # dataloader
-    train_dataloader = DataLoader(train_dataset,args.batch_size,shuffle=False,num_workers=4,pin_memory=args.pin_memory,drop_last=train_drop_last)
-    val_dataloder = DataLoader(val_dataset,args.batch_size,shuffle=False,num_workers=4,pin_memory=args.pin_memory,drop_last=val_drop_last)
-    
-        
-    train(args,chkpt,train_dataloader,val_dataloder)
+if __name__=='__main__':main()

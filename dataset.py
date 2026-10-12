@@ -7,6 +7,7 @@ import numpy as np
 import pykitti
 import open3d as o3d
 from utils import transform, se3
+from depth_projection import project_depth
 from PIL import Image
 import matplotlib
 
@@ -110,19 +111,22 @@ class ToTensor:
 
 class BaseKITTIDataset(Dataset):
     def __init__(self, basedir: str, batch_size: int, seqs=['04', '05'], cam_id: int = 2,
-                 meta_json='data_len.json', skip_frame=1,
+                 frame_manifest=None, meta_json='data_len.json', skip_frame=1,
                  voxel_size=0.3, pcd_sample_num=4096, resize_ratio=(0.5, 0.5), extend_ratio=(2.5, 2.5),
                  ):
         if not os.path.exists(os.path.join(basedir, meta_json)):
             check_length(basedir, meta_json)
         with open(os.path.join(basedir, meta_json), 'r') as f:
             dict_len = json.load(f)
+        manifest = None
+        if frame_manifest:
+            with open(frame_manifest) as f: manifest = json.load(f)
         frame_list = []
         for seq in seqs:
-            frame = list(range(0, dict_len[seq], skip_frame))
-            cut_index = len(frame) % batch_size
-            if cut_index > 0:
-                frame = frame[:-cut_index]  # each seq should have an integer number of batches
+            frame = list(manifest[seq]) if manifest is not None else list(range(0, dict_len[seq], skip_frame))
+            if len(set(frame)) != len(frame) or any(i < 0 or i >= dict_len[seq] for i in frame):
+                raise ValueError("Invalid frame manifest for sequence " + seq)
+            if not frame: raise ValueError("Empty sequence " + seq)
             frame_list.append(frame)
         self.kitti_datalist = [pykitti.odometry(basedir, seq, frames=frame) for seq, frame in zip(seqs, frame_list) if
                                len(frame) > 0]
@@ -219,19 +223,13 @@ class KITTI_perturb(Dataset):
             igt = se3.exp(self.perturb[:, index, :])  # (1,6) -> (1,4,4)
             _uncalibed_pcd = se3.transform(igt, calibed_pcd[None, ...]).squeeze(0)  # (3,N)
             igt.squeeze_(0)  # (4,4)
-        _uncalibed_depth_img = torch.zeros_like(data['depth_img'], dtype=torch.float32)
-        proj_pcd = InTran.matmul(_uncalibed_pcd)  # (3,3)x(3,N) -> (3,N)
-        proj_x = (proj_pcd[0, :] / proj_pcd[2, :]).type(torch.long)
-        proj_y = (proj_pcd[1, :] / proj_pcd[2, :]).type(torch.long)
-        rev = (0 <= proj_x) * (proj_x < W) * (0 <= proj_y) * (proj_y < H) * (proj_pcd[2, :] > 0)
-        proj_x = proj_x[rev]
-        proj_y = proj_y[rev]
-        _uncalibed_depth_img[proj_y, proj_x] = data['pcd_range'][rev]  # H,W
-        # add new item
-        new_data = dict(uncalibed_pcd=_uncalibed_pcd, uncalibed_depth_img=_uncalibed_depth_img, igt=igt)
-        data.update(new_data)
-        data['depth_img'] = self.pooling(data['depth_img'][None, ...])
-        data['uncalibed_depth_img'] = self.pooling(data['uncalibed_depth_img'][None, ...])
+        k = InTran.to(calibed_pcd)
+        shape = (H, W)
+        pool = self.pooling.kernel_size
+        reference_depth = project_depth(calibed_pcd[None], k, shape, pool)[0]
+        disturbed_depth = project_depth(_uncalibed_pcd[None], k, shape, pool)[0]
+        data.update(uncalibed_pcd=_uncalibed_pcd, igt=igt,
+                    depth_img=reference_depth, uncalibed_depth_img=disturbed_depth)
         return data
 
 # 确保路径存在，如果不存在则创建
